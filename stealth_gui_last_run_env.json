@@ -3,13 +3,13 @@
   "cmd": [
     "C:\\Users\\atomi\\Downloads\\STEALTH\\stealth_cryptor.exe",
     "C:\\Users\\atomi\\Downloads\\STEALTH\\tests\\message_c.exe",
-    "C:\\Users\\atomi\\Downloads\\STEALTH\\out_stub.exe",
-    "7578cad8d151f607b3d84614cc5176e68d9f20a1c53485344184210de0e382a4",
+    "C:\\Users\\atomi\\Downloads\\STEALTH\\out_stub_plugin.exe",
+    "d2d648e264240ce5cbd881ec85306c58bbcd961115e374d9da1ffb526be76ec3",
     "0",
     "0",
     "1"
   ],
-  "plugin_dir": null,
+  "plugin_dir": "C:\\Users\\atomi\\Downloads\\STEALTH\\plugins_gui_1764945111_3073",
   "env": {
     "ALLUSERSPROFILE": "C:\\ProgramData",
     "APPDATA": "C:\\Users\\atomi\\AppData\\Roaming",
@@ -76,9 +76,10 @@
     "VSCODE_DEBUGPY_ADAPTER_ENDPOINTS": "c:\\Users\\atomi\\.vscode\\extensions\\ms-python.debugpy-2025.16.0-win32-x64\\.noConfigDebugAdapterEndpoints\\endpoint-55d5704cce8556e0.txt",
     "BUNDLED_DEBUGPY_PATH": "c:\\Users\\atomi\\.vscode\\extensions\\ms-python.debugpy-2025.16.0-win32-x64\\bundled\\libs\\debugpy",
     "VSCODE_INJECTION": "1",
-    "VSCODE_NONCE": "179c4d60-7ef6-4c9b-8839-c321f189b7ee",
+    "VSCODE_NONCE": "a4e25c86-f4a9-4cc9-8282-ed76b0a78a80",
     "VSCODE_SHELL_ENV_REPORTING": "PATH,VIRTUAL_ENV,HOME,SHELL,PWD",
     "VSCODE_A11Y_MODE": "0",
-    "VSCODE_STABLE": "1"
+    "VSCODE_STABLE": "1",
+    "PLUGIN_DIR": "C:\\Users\\atomi\\Downloads\\STEALTH\\plugins_gui_1764945111_3073"
   }
 }

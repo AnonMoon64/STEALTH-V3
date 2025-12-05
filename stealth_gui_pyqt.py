@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""
-A modern PyQt GUI for the STEALTH toolset.
-- Tries to import PyQt6, falls back to PyQt5.
-- Provides fields for payload, output, key, options: dry-run, no-persist, no-hooks, disk-only.
-- Shows a confirmation dialog before running potentially dangerous operations.
-- Runs `stealth_cryptor.exe` and `stub.exe` via subprocess; in dry-run mode it only simulates commands.
-
-Keep this as a script (you said you may package later).
-"""
+"""PyQt GUI for the STEALTH toolset (frontend only, backend in `stealth_gui_backend.py`)."""
 import sys
 import os
-import shutil
-import subprocess
 from pathlib import Path
 from functools import partial
 import json
 from pathlib import Path as _Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PyQt6 import QtWidgets as _QtWidgets, QtCore as _QtCore, QtGui as _QtGui  # type: ignore
+    from PyQt5 import QtWidgets as _QtWidgets, QtCore as _QtCore, QtGui as _QtGui  # type: ignore
+
+from stealth_gui_backend import Backend
 
 # Visible settings file in workspace for predictable persistence
 SETTINGS_FILE = _Path.cwd() / 'stealth_gui_settings.json'
@@ -27,7 +24,7 @@ try:
     using = 'PyQt6'
 except Exception:
     try:
-        from PyQt5 import QtWidgets, QtCore, QtGui
+        from PyQt5 import QtWidgets, QtCore, QtGui  # type: ignore
         QtSignal = QtCore.pyqtSignal
         using = 'PyQt5'
     except Exception:
@@ -36,11 +33,16 @@ except Exception:
 
 APP_NAME = "STEALTH GUI"
 
-class MainWindow(QtWidgets.QMainWindow):
+class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(760, 420)
+        self.backend = Backend()
+        self.backend.line.connect(self._log)
+        self.backend.finished_rc.connect(self._on_backend_finished)
+        self._pending_plugins_dir = None
+        self._last_cmd = None
         self._build_ui()
         # Load persistent settings (last paths, plugins, options)
         try:
@@ -114,9 +116,19 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_h.addWidget(self.sim_btn)
         layout.addLayout(btn_h)
 
-        self.log = QtWidgets.QTextEdit()
-        self.log.setReadOnly(True)
-        layout.addWidget(self.log)
+        self.log_model = QtGui.QStandardItemModel(0, 3)
+        self.log_model.setHorizontalHeaderLabels(["Time", "Level", "Message"])
+        self.log_view = QtWidgets.QTableView()
+        self.log_view.setModel(self.log_model)
+        header = self.log_view.horizontalHeader()
+        if header:
+            header.setStretchLastSection(True)
+        self.log_view.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.log_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.log_view.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.log_view.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.log_view.customContextMenuRequested.connect(self._log_context_menu)
+        layout.addWidget(self.log_view)
 
         footer = QtWidgets.QLabel("Note: This GUI invokes local executables like `stealth_cryptor.exe`. Test safely in an isolated VM.")
         layout.addWidget(footer)
@@ -135,7 +147,7 @@ class MainWindow(QtWidgets.QMainWindow):
         p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select plugin DLL", str(Path.cwd()), "DLL Files (*.dll);;All Files (*)")
         if p:
             # Avoid duplicates
-            existing = [self.plugins_list.item(i).text() for i in range(self.plugins_list.count())]
+            existing = [self.plugins_list.item(i).text() for i in range(self.plugins_list.count()) if self.plugins_list.item(i)]  # type: ignore[attr-defined]
             if p in existing:
                 self._log_warning("Plugin already added")
                 return
@@ -205,36 +217,26 @@ class MainWindow(QtWidgets.QMainWindow):
         payload, out = self._validate_inputs() or (None, None)
         if not payload:
             return None
-        key = self.key_edit.text().strip()
-        # If no key provided, generate a random 32-byte key hex
-        if not key:
+        try:
+            cmd, key_used, generated = self.backend.build_command(
+                payload,
+                out,
+                self.key_edit.text(),
+                self.junk_spin.value(),
+                self.in_memory_cb.isChecked(),
+                log_fn=self._log_info,
+                warn_fn=self._log_warning,
+            )
+        except ValueError as e:
+            self._log_error(str(e))
+            return None
+        if generated:
             try:
-                key = os.urandom(32).hex()
-                self._log_info(f"Generated random key: {key}")
-                # set and persist generated key so GUI remembers it
-                try:
-                    self.key_edit.setText(key)
-                    self.save_settings()
-                except Exception:
-                    pass
+                self.key_edit.setText(key_used)
+                self.save_settings()
             except Exception:
-                self._log_warning("Could not generate random key — please provide a 64-char hex key")
-
-        # positional invocation expected by legacy stealth_cryptor: <payload> <output> <key_hex> <junk_mb> <persistence> <load_in_memory>
-        cryptor = Path.cwd() / 'stealth_cryptor.exe'
-        if not cryptor.exists():
-            self._log_warning("`stealth_cryptor.exe` not found in current directory; you must build it first (see build script)")
-
-        junk_mb = str(self.junk_spin.value())
-        # Persistence is managed via plugins; default to '0' (no persistence)
-        persistence = '0'
-        load_in_memory = '1' if self.in_memory_cb.isChecked() else '0'
-
-        crypt_cmd = [str(cryptor), str(payload), str(out), key, junk_mb, persistence, load_in_memory]
-        # Dry run is a GUI-local option — we don't pass it to the legacy cryptor
-        # Note: the legacy `stealth_cryptor.exe` discovers plugins by scanning a local
-        # `plugins\*.dll` folder. We do NOT pass `--plugin` flags (those are unsupported).
-        return crypt_cmd
+                pass
+        return cmd
 
     def load_settings(self):
         # Prefer explicit JSON settings file in workspace for easier testing/debugging
@@ -371,67 +373,16 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         return super().closeEvent(event)
 
-    def _prepare_plugins_folder(self):
-        """Stage selected plugin DLLs into a temporary plugins directory and return (temp_dir, copied_paths).
-        The packer will be invoked with the environment variable `PLUGIN_DIR` set to this temp_dir so only
-        staged plugins are included. The caller must cleanup the returned temp_dir via `_cleanup_plugins_folder`.
-        """
-        # If no plugins selected, skip creating a folder entirely
-        if self.plugins_list.count() == 0:
-            return None, []
-        cwd = Path.cwd()
-        # create a deterministic temp dir under workspace so packer can read files
-        import time, random
-        rnd = random.randint(1000, 9999)
-        plugins_dir = cwd / f'plugins_gui_{int(time.time())}_{rnd}'
-        copied = []
-        try:
-            plugins_dir.mkdir(parents=True, exist_ok=False)
-        except Exception as e:
-            self._log_warning(f"Could not create temporary plugins folder: {e}")
-            return None, copied
-
+    def _collect_plugin_entries(self):
+        entries = []
         for i in range(self.plugins_list.count()):
             item = self.plugins_list.item(i)
-            stored = item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
-            if stored:
-                src = Path(stored)
-            else:
-                # If no stored path, try to parse the displayed text as a filename in cwd
-                src = Path(item.text())
-            if not src.exists():
-                self._log_warning(f"Plugin not found: {src}")
+            if not item:
                 continue
-            dest = plugins_dir / src.name
-            try:
-                shutil.copy2(str(src), str(dest))
-                copied.append(str(dest))
-                # write metadata file next to copied plugin so packer can pick up stage/order
-                try:
-                    stage, order = (0, 0)
-                    data = item.data(QtCore.Qt.ItemDataRole.UserRole)
-                    if data:
-                        stage, order = data
-                    meta_path = plugins_dir / (src.name + '.meta')
-                    with open(meta_path, 'w', encoding='utf-8') as mf:
-                        mf.write(f"stage={stage}\n")
-                        mf.write(f"order={order}\n")
-                    copied.append(str(meta_path))
-                except Exception:
-                    pass
-            except Exception as e:
-                self._log_warning(f"Failed to copy plugin {src} -> {dest}: {e}")
-        return str(plugins_dir), copied
-
-    def _cleanup_plugins_folder(self, temp_dir, copied=None, backups=None):
-        # If we created a temporary plugins dir, remove it entirely.
-        if not temp_dir:
-            return
-        try:
-            shutil.rmtree(temp_dir)
-        except Exception:
-            pass
-        return
+            stage, order = item.data(QtCore.Qt.ItemDataRole.UserRole) or (0, 0)
+            stored = item.data(QtCore.Qt.ItemDataRole.UserRole + 1) or ''
+            entries.append({'path': stored, 'stage': int(stage), 'order': int(order)})
+        return entries
 
     def _edit_plugin_item(self, item):
         # Edit stage/order for an existing item
@@ -473,170 +424,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_info("Simulated command:")
         self._log_info(' '.join(f'"{c}"' for c in cmd))
 
-    def _run_subprocess(self, cmd):
-        # Run subprocess and stream output to log
-        try:
-            self._log_info(f"Running: {cmd[0]}")
-            # Diagnostic: log working directory and PLUGIN_DIR so we can reproduce environment issues
-            try:
-                cwd = os.getcwd()
-                self._log_info(f"CWD: {cwd}")
-                plugin_dir = os.environ.get('PLUGIN_DIR')
-                if plugin_dir:
-                    self._log_info(f"PLUGIN_DIR (env): {plugin_dir}")
-                    try:
-                        files = list(Path(plugin_dir).glob('*'))
-                        self._log_info(f"PLUGIN_DIR contains {len(files)} entries")
-                        for f in files[:20]:
-                            self._log_info(f" - {f.name} ({f.stat().st_size} bytes)")
-                    except Exception:
-                        self._log_warning("Could not enumerate PLUGIN_DIR contents")
-                else:
-                    self._log_info("PLUGIN_DIR not set in environment")
-                # Dump full environment + command to a diagnostic file for debugging GUI-launched runs
-                try:
-                    diag = {
-                        'cwd': cwd,
-                        'cmd': cmd,
-                        'plugin_dir': plugin_dir,
-                        'env': dict(os.environ)
-                    }
-                    import json
-                    env_path = Path.cwd() / 'stealth_gui_last_run_env.json'
-                    with open(env_path, 'w', encoding='utf-8') as ef:
-                        json.dump(diag, ef, indent=2)
-                    self._log_info(f"Wrote GUI env dump to: {env_path}")
-                except Exception:
-                    self._log_warning("Could not write GUI env dump file")
-            except Exception:
-                pass
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            if p.stdout is not None:
-                for line in p.stdout:
-                    self._log(line.rstrip())
-            p.wait()
-            rc = p.returncode
-            # If the process exited with a NTSTATUS-like code (high bit set), show hex and hint
-            try:
-                u32 = rc & 0xFFFFFFFF
-            except Exception:
-                u32 = rc
-            if isinstance(u32, int) and u32 >= 0x80000000:
-                # Map a few well-known NTSTATUS codes to friendly names
-                status_map = {
-                    0xC0000005: 'STATUS_ACCESS_VIOLATION',
-                    0xC0000374: 'STATUS_HEAP_CORRUPTION',
-                    0xC0000008: 'STATUS_INVALID_HANDLE',
-                    0xC0000096: 'STATUS_ILLEGAL_INSTRUCTION'
-                }
-                human = status_map.get(u32, None)
-                if human:
-                    self._log_error(f"Process exited with NTSTATUS {hex(u32)} ({human})")
-                else:
-                    self._log_error(f"Process exited with NTSTATUS {hex(u32)}")
-                self._log_error("This usually indicates a crash in the child process (heap corruption, access violation, etc.). Try running the executable directly in a debugger or a console to capture more details.")
-                # On NTSTATUS crash, also write the same diagnostic file (if not already) to help offline analysis
-                try:
-                    diag_path = Path.cwd() / 'stealth_gui_last_run_env.json'
-                    if not diag_path.exists():
-                        diag = {'cwd': os.getcwd(), 'cmd': cmd, 'plugin_dir': os.environ.get('PLUGIN_DIR'), 'env': dict(os.environ)}
-                        import json
-                        with open(diag_path, 'w', encoding='utf-8') as ef:
-                            json.dump(diag, ef, indent=2)
-                        self._log_info(f"Wrote GUI env dump to: {diag_path}")
-                except Exception:
-                    pass
-            else:
-                if rc != 0:
-                    self._log_error(f"Process exited: {rc}")
-                    self._log_error("Cryptor failed — aborting")
-                else:
-                    self._log_info(f"Process exited: {rc}")
-            return p.returncode
-        except FileNotFoundError:
-            self._log_error(f"Executable not found: {cmd[0]}")
-            return -1
-        except Exception as e:
-            self._log_error(str(e))
-            return -1
-
-    class SubprocessWorker(QtCore.QObject):
-        """Worker that runs a subprocess on a Python thread and emits Qt signals for output and completion."""
-        line = QtSignal(str)
-        finished_rc = QtSignal(int)
-
-        def __init__(self, cmd, parent=None):
-            super().__init__(parent)
-            self.cmd = cmd
-            self._thread = None
-
-        def start(self):
-            import threading
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
-
-        def _run(self):
-            try:
-                try:
-                    cwd = os.getcwd()
-                    plugin_dir = os.environ.get('PLUGIN_DIR')
-                    diag = {'cwd': cwd, 'cmd': self.cmd, 'plugin_dir': plugin_dir, 'env': dict(os.environ)}
-                    import json
-                    env_path = Path.cwd() / 'stealth_gui_last_run_env.json'
-                    with open(env_path, 'w', encoding='utf-8') as ef:
-                        json.dump(diag, ef, indent=2)
-                except Exception:
-                    pass
-
-                # Use blocking run() like the original non-PyQt GUI so we capture full stderr for debugging
-                try:
-                    creation_flags = 0
-                    if hasattr(subprocess, 'CREATE_NO_WINDOW'):
-                        creation_flags = subprocess.CREATE_NO_WINDOW
-                    result = subprocess.run(self.cmd, capture_output=True, text=True, creationflags=creation_flags)
-                except Exception:
-                    # Fall back to Popen if run() is not available or fails
-                    p = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    out, err = p.communicate()
-                    from types import SimpleNamespace
-                    result = SimpleNamespace(returncode=p.returncode, stdout=out, stderr=err)
-
-                # Emit captured stdout lines
-                try:
-                    if result.stdout:
-                        for ln in result.stdout.splitlines():
-                            try:
-                                self.line.emit(ln)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                # Emit captured stderr as error lines for easier debugging (match old GUI behavior)
-                try:
-                    if result.stderr:
-                        for ln in result.stderr.splitlines():
-                            try:
-                                self.line.emit(f"[ERR] {ln}")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-                rc = result.returncode
-                try:
-                    self.finished_rc.emit(rc)
-                except Exception:
-                    pass
-            except Exception:
-                try:
-                    self.line.emit(f"[ERR] Worker exception: {exc}")
-                except Exception:
-                    pass
-                try:
-                    self.finished_rc.emit(-1)
-                except Exception:
-                    pass
-
     def on_run(self):
         if not self._confirm_action():
             self._log_warning("Operation cancelled by user")
@@ -653,94 +440,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if not stub_path.exists():
             self._log_warning("`stub.exe` not found in workspace — packer will embed whatever stub is present. Build `stub.exe` first for GUI (no console) behavior.")
 
-        # Prepare plugins folder (stage selected plugin DLLs into a temporary folder)
-        plugins_temp_dir, copied = self._prepare_plugins_folder()
-        # If we created a temp dir, set PLUGIN_DIR so the packer only sees staged plugins
-        prev_plugin_dir = os.environ.get('PLUGIN_DIR')
-        if plugins_temp_dir:
-            os.environ['PLUGIN_DIR'] = plugins_temp_dir
-            self._log_info(f"Staged plugins into temporary folder: {plugins_temp_dir}")
-        # Execute cryptor asynchronously so GUI stays responsive
+        entries = self._collect_plugin_entries()
+        plugins_temp_dir, _ = self.backend.stage_plugins(entries, log_fn=self._log_info, warn_fn=self._log_warning)
+        self._pending_plugins_dir = plugins_temp_dir
+        self._last_cmd = cmd
         self._log_info("Starting packer in background...")
         self._log_info(' '.join(f'"{c}"' for c in cmd))
         self.run_btn.setEnabled(False)
         self.sim_btn.setEnabled(False)
-        self._worker = MainWindow.SubprocessWorker(cmd)
-        worker = self._worker
-        # forward worker output to GUI log
-        worker.line.connect(self._log)
-
-        def _on_finished(rc):
-            try:
-                if isinstance(rc, int) and rc >= 0:
-                    # If NTSTATUS-like code, the previous synchronous path handled hex; replicate here
-                    try:
-                        u32 = rc & 0xFFFFFFFF
-                    except Exception:
-                        u32 = rc
-                    if isinstance(u32, int) and u32 >= 0x80000000:
-                        status_map = {
-                            0xC0000005: 'STATUS_ACCESS_VIOLATION',
-                            0xC0000374: 'STATUS_HEAP_CORRUPTION',
-                            0xC0000008: 'STATUS_INVALID_HANDLE',
-                            0xC0000096: 'STATUS_ILLEGAL_INSTRUCTION'
-                        }
-                        human = status_map.get(u32, None)
-                        if human:
-                            self._log_error(f"Process exited with NTSTATUS {hex(u32)} ({human})")
-                        else:
-                            self._log_error(f"Process exited with NTSTATUS {hex(u32)}")
-                        self._log_error("This usually indicates a crash in the child process (heap corruption, access violation, etc.). Try running the executable directly in a debugger or a console to capture more details.")
-                        # ensure env dump exists
-                        try:
-                            diag_path = Path.cwd() / 'stealth_gui_last_run_env.json'
-                            if not diag_path.exists():
-                                import json
-                                diag = {'cwd': os.getcwd(), 'cmd': cmd, 'plugin_dir': os.environ.get('PLUGIN_DIR'), 'env': dict(os.environ)}
-                                with open(diag_path, 'w', encoding='utf-8') as ef:
-                                    json.dump(diag, ef, indent=2)
-                                self._log_info(f"Wrote GUI env dump to: {diag_path}")
-                        except Exception:
-                            pass
-                    else:
-                        if rc != 0:
-                            self._log_error(f"Process exited: {rc}")
-                            self._log_error("Cryptor failed — aborting")
-                        else:
-                            self._log_info(f"Process exited: {rc}")
-                else:
-                    self._log_error(f"Cryptor failed — aborting (rc={rc})")
-            finally:
-                # Cleanup temp plugins folder
-                try:
-                    self._cleanup_plugins_folder(plugins_temp_dir, copied)
-                except Exception:
-                    pass
-                # restore previous PLUGIN_DIR env var
-                try:
-                    if prev_plugin_dir is None:
-                        if 'PLUGIN_DIR' in os.environ:
-                            del os.environ['PLUGIN_DIR']
-                    else:
-                        os.environ['PLUGIN_DIR'] = prev_plugin_dir
-                except Exception:
-                    pass
-                # Re-enable buttons
-                try:
-                    self.run_btn.setEnabled(True)
-                    self.sim_btn.setEnabled(True)
-                except Exception:
-                    pass
-                # Release worker reference
-                try:
-                    self._worker = None
-                except Exception:
-                    pass
-
-        worker.finished_rc.connect(_on_finished)
-        worker.start()
-        # Keep a reference so GC doesn't collect the worker while running
-        self._worker = worker
+        disable_default_plugins = plugins_temp_dir is None
+        if disable_default_plugins:
+            self._log_info("No plugins selected; default plugin directory disabled")
+        self.backend.start_process(cmd, plugin_dir=plugins_temp_dir, disable_plugins_default=disable_default_plugins)
 
     def _collect_logs(self, pid, payload_out):
         # Read plugin and debug logs from %TEMP% and append tail to GUI log
@@ -759,17 +470,102 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception as e:
                     self._log_warning(f"Could not read {f}: {e}")
 
+    def _on_backend_finished(self, rc):
+        try:
+            if isinstance(rc, int) and rc >= 0:
+                u32 = rc & 0xFFFFFFFF if isinstance(rc, int) else rc
+                if isinstance(u32, int) and u32 >= 0x80000000:
+                    status_map = {
+                        0xC0000005: 'STATUS_ACCESS_VIOLATION',
+                        0xC0000374: 'STATUS_HEAP_CORRUPTION',
+                        0xC0000008: 'STATUS_INVALID_HANDLE',
+                        0xC0000096: 'STATUS_ILLEGAL_INSTRUCTION'
+                    }
+                    human = status_map.get(u32)
+                    if human:
+                        self._log_error(f"Process exited with NTSTATUS {hex(u32)} ({human})")
+                    else:
+                        self._log_error(f"Process exited with NTSTATUS {hex(u32)}")
+                    self._log_error("This usually indicates a crash in the child process (heap corruption, access violation, etc.). Try running the executable directly in a debugger or a console to capture more details.")
+                else:
+                    if rc != 0:
+                        self._log_error(f"Process exited: {rc}")
+                        self._log_error("Cryptor failed — aborting")
+                    else:
+                        self._log_info(f"Process exited: {rc}")
+            else:
+                self._log_error(f"Cryptor failed — aborting (rc={rc})")
+        finally:
+            try:
+                self.backend.cleanup_plugins(self._pending_plugins_dir)
+            except Exception:
+                pass
+            self._pending_plugins_dir = None
+            try:
+                self.run_btn.setEnabled(True)
+                self.sim_btn.setEnabled(True)
+            except Exception:
+                pass
+            self._last_cmd = None
+
+    def _append_log_row(self, level, message):
+        ts = QtCore.QDateTime.currentDateTime().toString("HH:mm:ss")
+        items = [QtGui.QStandardItem(ts), QtGui.QStandardItem(level), QtGui.QStandardItem(message)]
+        for it in items:
+            it.setEditable(False)
+        self.log_model.appendRow(items)
+        self.log_view.scrollToBottom()
+
+    def _log_context_menu(self, pos):
+        menu = QtWidgets.QMenu(self)
+        copy_action = menu.addAction("Copy all rows")
+        clear_action = menu.addAction("Clear log")
+        viewport = self.log_view.viewport()
+        action = menu.exec(viewport.mapToGlobal(pos) if viewport else QtCore.QPoint())
+        if action == copy_action:
+            self._copy_log_selection()
+        elif action == clear_action:
+            self.log_model.removeRows(0, self.log_model.rowCount())
+
+    def _copy_log_selection(self):
+        selection = self.log_view.selectionModel()
+        rows = list(range(self.log_model.rowCount()))
+        lines = []
+        for r in rows:
+            cols = []
+            for c in range(self.log_model.columnCount()):
+                item = self.log_model.item(r, c)
+                cols.append(item.text() if item else "")
+            lines.append("\t".join(cols))
+        cb = QtWidgets.QApplication.clipboard()
+        if cb:
+            cb.setText("\n".join(lines))
+
     def _log(self, s):
-        self.log.append(s)
+        level = "INFO"
+        msg = s
+        if s.startswith("[ERR]"):
+            level = "ERROR"
+            msg = s[5:]
+        elif s.startswith("[ERROR]"):
+            level = "ERROR"
+            msg = s[7:]
+        elif s.startswith("[WARN]"):
+            level = "WARN"
+            msg = s[6:]
+        elif s.startswith("[INFO]"):
+            level = "INFO"
+            msg = s[6:]
+        self._append_log_row(level, msg)
 
     def _log_info(self, s):
-        self._log(f"[INFO] {s}")
+        self._append_log_row("INFO", s)
 
     def _log_warning(self, s):
-        self._log(f"[WARN] {s}")
+        self._append_log_row("WARN", s)
 
     def _log_error(self, s):
-        self._log(f"[ERROR] {s}")
+        self._append_log_row("ERROR", s)
 
 
 def main():
