@@ -233,7 +233,6 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         if generated:
             try:
                 self.key_edit.setText(key_used)
-                self.save_settings()
             except Exception:
                 pass
         return cmd
@@ -246,7 +245,6 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                     data = json.load(fh)
                 payload = data.get('payload')
                 output = data.get('output')
-                key = data.get('key')
                 junk = data.get('junk', 0)
                 in_memory = data.get('in_memory', True)
                 plugins = data.get('plugins', [])
@@ -254,8 +252,6 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                     self.payload_edit.setText(payload)
                 if output:
                     self.output_edit.setText(output)
-                if key:
-                    self.key_edit.setText(key)
                 try:
                     self.junk_spin.setValue(int(junk))
                 except Exception:
@@ -285,7 +281,6 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             settings = QtCore.QSettings('STEALTH', 'GUI')
             payload = settings.value('payload', type=str)
             output = settings.value('output', type=str)
-            key = settings.value('key', type=str)
             junk = settings.value('junk', 0, type=int)
             in_memory = settings.value('in_memory', True, type=bool)
             plugins_json = settings.value('plugins', '', type=str)
@@ -293,8 +288,6 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                 self.payload_edit.setText(payload)
             if output:
                 self.output_edit.setText(output)
-            if key:
-                self.key_edit.setText(key)
             try:
                 self.junk_spin.setValue(int(junk))
             except Exception:
@@ -329,7 +322,6 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             data = {
                 'payload': self.payload_edit.text(),
                 'output': self.output_edit.text(),
-                'key': self.key_edit.text(),
                 'junk': int(self.junk_spin.value()),
                 'in_memory': bool(self.in_memory_cb.isChecked()),
                 'plugins': []
@@ -351,7 +343,6 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             settings = QtCore.QSettings('STEALTH', 'GUI')
             settings.setValue('payload', self.payload_edit.text())
             settings.setValue('output', self.output_edit.text())
-            settings.setValue('key', self.key_edit.text())
             settings.setValue('junk', int(self.junk_spin.value()))
             settings.setValue('in_memory', bool(self.in_memory_cb.isChecked()))
             items = []

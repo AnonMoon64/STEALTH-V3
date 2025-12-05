@@ -38,19 +38,6 @@ class SubprocessWorker(QtCore.QObject):
     def _run(self):
         rc = -1
         try:
-            try:
-                diag = {
-                    'cwd': os.getcwd(),
-                    'cmd': self.cmd,
-                    'plugin_dir': self.env.get('PLUGIN_DIR'),
-                    'env': dict(self.env),
-                }
-                env_path = Path.cwd() / 'stealth_gui_last_run_env.json'
-                with open(env_path, 'w', encoding='utf-8') as ef:
-                    json.dump(diag, ef, indent=2)
-            except Exception:
-                pass
-
             creation_flags = 0
             if hasattr(subprocess, 'CREATE_NO_WINDOW'):
                 creation_flags = subprocess.CREATE_NO_WINDOW
