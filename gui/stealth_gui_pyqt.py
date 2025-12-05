@@ -9,22 +9,28 @@ from pathlib import Path as _Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from PyQt6 import QtWidgets as _QtWidgets, QtCore as _QtCore, QtGui as _QtGui  # type: ignore
-    from PyQt5 import QtWidgets as _QtWidgets, QtCore as _QtCore, QtGui as _QtGui  # type: ignore
+    from PyQt6 import QtWidgets as _QtWidgets, QtCore as _QtCore, QtGui as _QtGui, QtMultimedia as _QtMultimedia  # type: ignore
+    from PyQt5 import QtWidgets as _QtWidgets, QtCore as _QtCore, QtGui as _QtGui, QtMultimedia as _QtMultimedia  # type: ignore
 
 from stealth_gui_backend import Backend
 
 # Visible settings file in workspace for predictable persistence
-SETTINGS_FILE = _Path.cwd() / 'stealth_gui_settings.json'
+ROOT_DIR = _Path(__file__).resolve().parent.parent
+BIN_DIR = ROOT_DIR / 'bin'
+DATA_DIR = ROOT_DIR / 'data'
+OUTPUT_DIR = BIN_DIR / 'output'
+ICON_PATH = ROOT_DIR / 'gui' / 'icon' / 'icon.ico'
+SOUND_PATH = ROOT_DIR / 'gui' / 'audio' / 'notification.wav'
+SETTINGS_FILE = DATA_DIR / 'stealth_gui_settings.json'
 
 # Try PyQt6 then PyQt5
 try:
-    from PyQt6 import QtWidgets, QtCore, QtGui
+    from PyQt6 import QtWidgets, QtCore, QtGui, QtMultimedia
     QtSignal = QtCore.pyqtSignal
     using = 'PyQt6'
 except Exception:
     try:
-        from PyQt5 import QtWidgets, QtCore, QtGui  # type: ignore
+        from PyQt5 import QtWidgets, QtCore, QtGui, QtMultimedia  # type: ignore
         QtSignal = QtCore.pyqtSignal
         using = 'PyQt5'
     except Exception:
@@ -38,12 +44,30 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(760, 420)
+        try:
+            if ICON_PATH.exists():
+                self.setWindowIcon(QtGui.QIcon(str(ICON_PATH)))
+        except Exception:
+            pass
         self.backend = Backend()
         self.backend.line.connect(self._log)
         self.backend.finished_rc.connect(self._on_backend_finished)
         self._pending_plugins_dir = None
+        self._pending_binder_cmd = None
         self._last_cmd = None
+        self._current_phase = None
+        self._output_path = None
+        self._binder_output_path = None
+        self._icon_path = None
+        self._last_plugin_dir = BIN_DIR / 'plugins'
+        self._icon_applied_prepack = False
+        self._sound = None
+        self._init_sound()
         self._build_ui()
+        try:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         # Load persistent settings (last paths, plugins, options)
         try:
             self.load_settings()
@@ -66,7 +90,7 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         payload_h = QtWidgets.QHBoxLayout(); payload_h.addWidget(self.payload_edit); payload_h.addWidget(self.payload_btn)
         form.addRow("Payload:", payload_h)
 
-        self.output_edit = QtWidgets.QLineEdit(str(Path.cwd() / "out_stub.exe"))
+        self.output_edit = QtWidgets.QLineEdit(str(OUTPUT_DIR / "out_stub.exe"))
         self.output_btn = QtWidgets.QPushButton("Browse...")
         self.output_btn.clicked.connect(partial(self._pick_save, self.output_edit))
         output_h = QtWidgets.QHBoxLayout(); output_h.addWidget(self.output_edit); output_h.addWidget(self.output_btn)
@@ -90,6 +114,25 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         options_h.addWidget(self.dry_run_cb)
         options_h.addWidget(self.in_memory_cb)
         form.addRow("Options:", options_h)
+
+        # Binder options
+        self.enable_binder_cb = QtWidgets.QCheckBox("Run binder after build")
+        self.binder_exe2_edit = QtWidgets.QLineEdit()
+        self.binder_exe2_btn = QtWidgets.QPushButton("Browse...")
+        self.binder_exe2_btn.clicked.connect(partial(self._pick_file, self.binder_exe2_edit))
+        binder_exe2_h = QtWidgets.QHBoxLayout(); binder_exe2_h.addWidget(self.binder_exe2_edit); binder_exe2_h.addWidget(self.binder_exe2_btn)
+        self.binder_output_edit = QtWidgets.QLineEdit(str(OUTPUT_DIR / "out_binder.exe"))
+        self.binder_output_btn = QtWidgets.QPushButton("Browse...")
+        self.binder_output_btn.clicked.connect(partial(self._pick_save, self.binder_output_edit))
+        binder_out_h = QtWidgets.QHBoxLayout(); binder_out_h.addWidget(self.binder_output_edit); binder_out_h.addWidget(self.binder_output_btn)
+        self.binder_icon_edit = QtWidgets.QLineEdit()
+        self.binder_icon_btn = QtWidgets.QPushButton("Browse...")
+        self.binder_icon_btn.clicked.connect(partial(self._pick_file, self.binder_icon_edit))
+        binder_icon_h = QtWidgets.QHBoxLayout(); binder_icon_h.addWidget(self.binder_icon_edit); binder_icon_h.addWidget(self.binder_icon_btn)
+        form.addRow("Binder: enable", self.enable_binder_cb)
+        form.addRow("Binder exe2:", binder_exe2_h)
+        form.addRow("Binder output:", binder_out_h)
+        form.addRow("Output icon (optional):", binder_icon_h)
 
         # Plugins UI (select multiple plugin DLLs)
         self.plugins_list = QtWidgets.QListWidget()
@@ -128,9 +171,10 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         self.log_view.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.log_view.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.log_view.customContextMenuRequested.connect(self._log_context_menu)
+        self.log_view.setMinimumHeight(240)
         layout.addWidget(self.log_view)
 
-        footer = QtWidgets.QLabel("Note: This GUI invokes local executables like `stealth_cryptor.exe`. Test safely in an isolated VM.")
+        footer = QtWidgets.QLabel("Note: This GUI invokes local executables in bin/. Test safely in an isolated VM.")
         layout.addWidget(footer)
 
     def _pick_file(self, lineedit):
@@ -139,18 +183,23 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             lineedit.setText(p)
 
     def _pick_save(self, lineedit):
-        p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Select output", str(Path.cwd() / "out_stub.exe"))
+        p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Select output", str(OUTPUT_DIR / "out_stub.exe"))
         if p:
             lineedit.setText(p)
 
     def _add_plugin(self):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select plugin DLL", str(Path.cwd()), "DLL Files (*.dll);;All Files (*)")
+        start_dir = str(self._last_plugin_dir) if self._last_plugin_dir else str(BIN_DIR / "plugins")
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select plugin DLL", start_dir, "DLL Files (*.dll);;All Files (*)")
         if p:
             # Avoid duplicates
             existing = [self.plugins_list.item(i).text() for i in range(self.plugins_list.count()) if self.plugins_list.item(i)]  # type: ignore[attr-defined]
             if p in existing:
                 self._log_warning("Plugin already added")
                 return
+            try:
+                self._last_plugin_dir = Path(p).parent
+            except Exception:
+                pass
             # Ask for stage and order
             dlg = QtWidgets.QDialog(self)
             dlg.setWindowTitle("Plugin Stage/Order")
@@ -158,6 +207,7 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             v.addWidget(QtWidgets.QLabel(f"Configure stage/order for plugin: {Path(p).name}"))
             stage_cb = QtWidgets.QComboBox()
             stage_cb.addItems(["PRELAUNCH", "PREINJECT", "POSTLAUNCH", "ONEXIT", "ONFAIL"])
+            stage_cb.setCurrentIndex(2)  # default to POSTLAUNCH so UI plugins show after payload
             order_spin = QtWidgets.QSpinBox()
             order_spin.setRange(0, 65535)
             order_spin.setValue(0)
@@ -214,9 +264,26 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         return res == QtWidgets.QDialog.DialogCode.Accepted and cb.isChecked()
 
     def _build_command(self):
-        payload, out = self._validate_inputs() or (None, None)
-        if not payload:
+        validated = self._validate_inputs()
+        if not validated:
             return None
+        payload, out = validated
+        self._output_path = out
+        self._binder_output_path = None
+        icon_text = (self.binder_icon_edit.text() or '').strip()
+        # If blank, skip icon stamping entirely; otherwise use user selection
+        if icon_text:
+            try:
+                icon_path = Path(icon_text).expanduser().resolve()
+                if not icon_path.exists():
+                    self._log_warning(f"Icon not found: {icon_path}")
+                    icon_path = None
+            except Exception as exc:
+                self._log_warning(f"Icon path invalid: {exc}")
+                icon_path = None
+            self._icon_path = icon_path
+        else:
+            self._icon_path = None
         try:
             cmd, key_used, generated = self.backend.build_command(
                 payload,
@@ -230,12 +297,30 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         except ValueError as e:
             self._log_error(str(e))
             return None
+        binder_cmd = None
+        if self.enable_binder_cb.isChecked():
+            binder_out = Path(self.binder_output_edit.text() or str(OUTPUT_DIR / "out_binder.exe"))
+            self._binder_output_path = binder_out
+            exe2_text = self.binder_exe2_edit.text() or ''
+            try:
+                binder_cmd = self.backend.build_binder_command(
+                    out,
+                    exe2_text,
+                    str(binder_out),
+                    name1=out.name,
+                    name2=Path(exe2_text).name if exe2_text else '',
+                    icon_path=icon_text,
+                    warn_fn=self._log_warning,
+                )
+            except Exception as exc:
+                self._log_error(str(exc))
+                return None
         if generated:
             try:
                 self.key_edit.setText(key_used)
             except Exception:
                 pass
-        return cmd
+        return (cmd, binder_cmd)
 
     def load_settings(self):
         # Prefer explicit JSON settings file in workspace for easier testing/debugging
@@ -248,10 +333,30 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                 junk = data.get('junk', 0)
                 in_memory = data.get('in_memory', True)
                 plugins = data.get('plugins', [])
+                plugins_dir = data.get('plugins_dir')
+                binder_exe2 = data.get('binder_exe2')
+                binder_output = data.get('binder_output')
+                binder_icon = data.get('binder_icon')
+                binder_enabled = data.get('binder_enabled', False)
                 if payload:
                     self.payload_edit.setText(payload)
                 if output:
                     self.output_edit.setText(output)
+                if binder_exe2:
+                    self.binder_exe2_edit.setText(binder_exe2)
+                if binder_output:
+                    self.binder_output_edit.setText(binder_output)
+                if binder_icon:
+                    self.binder_icon_edit.setText(binder_icon)
+                if plugins_dir:
+                    try:
+                        self._last_plugin_dir = Path(plugins_dir)
+                    except Exception:
+                        pass
+                try:
+                    self.enable_binder_cb.setChecked(bool(binder_enabled))
+                except Exception:
+                    pass
                 try:
                     self.junk_spin.setValue(int(junk))
                 except Exception:
@@ -268,10 +373,11 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                         order = int(it.get('order', 0))
                         if not p:
                             continue
+                        resolved = self._resolve_plugin_path(p)
                         item = QtWidgets.QListWidgetItem()
                         item.setData(QtCore.Qt.ItemDataRole.UserRole, (stage, order))
-                        item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, p)
-                        item.setText(f"{Path(p).name} [{stage_names[stage]}:{order}]")
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, str(resolved))
+                        item.setText(f"{Path(resolved).name} [{stage_names[stage]}:{order}]")
                         self.plugins_list.addItem(item)
                 return
         except Exception:
@@ -284,10 +390,30 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             junk = settings.value('junk', 0, type=int)
             in_memory = settings.value('in_memory', True, type=bool)
             plugins_json = settings.value('plugins', '', type=str)
+            plugins_dir = settings.value('plugins_dir', type=str)
+            binder_exe2 = settings.value('binder_exe2', type=str)
+            binder_output = settings.value('binder_output', type=str)
+            binder_icon = settings.value('binder_icon', type=str)
+            binder_enabled = settings.value('binder_enabled', False, type=bool)
             if payload:
                 self.payload_edit.setText(payload)
             if output:
                 self.output_edit.setText(output)
+            if binder_exe2:
+                self.binder_exe2_edit.setText(binder_exe2)
+            if binder_output:
+                self.binder_output_edit.setText(binder_output)
+            if binder_icon:
+                self.binder_icon_edit.setText(binder_icon)
+            if plugins_dir:
+                try:
+                    self._last_plugin_dir = Path(plugins_dir)
+                except Exception:
+                    pass
+            try:
+                self.enable_binder_cb.setChecked(bool(binder_enabled))
+            except Exception:
+                pass
             try:
                 self.junk_spin.setValue(int(junk))
             except Exception:
@@ -306,10 +432,11 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                         order = int(it.get('order', 0))
                         if not p:
                             continue
+                        resolved = self._resolve_plugin_path(p)
                         item = QtWidgets.QListWidgetItem()
                         item.setData(QtCore.Qt.ItemDataRole.UserRole, (stage, order))
-                        item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, p)
-                        item.setText(f"{Path(p).name} [{stage_names[stage]}:{order}]")
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, str(resolved))
+                        item.setText(f"{Path(resolved).name} [{stage_names[stage]}:{order}]")
                         self.plugins_list.addItem(item)
                 except Exception:
                     pass
@@ -324,7 +451,11 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                 'output': self.output_edit.text(),
                 'junk': int(self.junk_spin.value()),
                 'in_memory': bool(self.in_memory_cb.isChecked()),
-                'plugins': []
+                'plugins': [],
+                'binder_exe2': self.binder_exe2_edit.text(),
+                'binder_output': self.binder_output_edit.text(),
+                'binder_icon': self.binder_icon_edit.text(),
+                'binder_enabled': bool(self.enable_binder_cb.isChecked()),
             }
             for i in range(self.plugins_list.count()):
                 it = self.plugins_list.item(i)
@@ -333,6 +464,7 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                 data_role = it.data(QtCore.Qt.ItemDataRole.UserRole) or (0, 0)
                 stored = it.data(QtCore.Qt.ItemDataRole.UserRole + 1) or ''
                 data['plugins'].append({'path': stored, 'stage': int(data_role[0]), 'order': int(data_role[1])})
+            data['plugins_dir'] = str(self._last_plugin_dir) if self._last_plugin_dir else ''
             with open(SETTINGS_FILE, 'w', encoding='utf-8') as fh:
                 json.dump(data, fh, indent=2)
             return
@@ -345,6 +477,11 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             settings.setValue('output', self.output_edit.text())
             settings.setValue('junk', int(self.junk_spin.value()))
             settings.setValue('in_memory', bool(self.in_memory_cb.isChecked()))
+            settings.setValue('binder_exe2', self.binder_exe2_edit.text())
+            settings.setValue('binder_output', self.binder_output_edit.text())
+            settings.setValue('binder_icon', self.binder_icon_edit.text())
+            settings.setValue('binder_enabled', bool(self.enable_binder_cb.isChecked()))
+            settings.setValue('plugins_dir', str(self._last_plugin_dir) if self._last_plugin_dir else '')
             items = []
             for i in range(self.plugins_list.count()):
                 it = self.plugins_list.item(i)
@@ -408,41 +545,101 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             stage_names = ["PRELAUNCH", "PREINJECT", "POSTLAUNCH", "ONEXIT", "ONFAIL"]
             item.setText(f"{path.name} [{stage_names[stage_cb.currentIndex()]}:{order_spin.value()}]")
 
+    def _resolve_plugin_path(self, saved_path):
+        """Try to relocate a saved plugin path if it was moved. Prefers current plugin dir."""
+        try:
+            cand = Path(saved_path)
+        except Exception:
+            return saved_path
+        if cand.exists():
+            return cand
+        name = cand.name
+        search_bases = []
+        if self._last_plugin_dir:
+            search_bases.append(self._last_plugin_dir)
+        search_bases.append(BIN_DIR / 'plugins')
+        search_bases.append(ROOT_DIR / 'plugins')
+        for base in search_bases:
+            if not base:
+                continue
+            candidate = base / name
+            if candidate.exists():
+                try:
+                    self._last_plugin_dir = base
+                except Exception:
+                    pass
+                return candidate
+        return cand
+
     def on_simulate(self):
-        cmd = self._build_command()
-        if not cmd:
+        res = self._build_command()
+        if not res:
             return
+        pack_cmd, binder_cmd = res
         self._log_info("Simulated command:")
-        self._log_info(' '.join(f'"{c}"' for c in cmd))
+        self._log_info(' '.join(f'"{c}"' for c in pack_cmd))
+        if binder_cmd:
+            self._log_info(' '.join(f'"{c}"' for c in binder_cmd))
 
     def on_run(self):
         if not self._confirm_action():
             self._log_warning("Operation cancelled by user")
             return
-        cmd = self._build_command()
-        if not cmd:
+        res = self._build_command()
+        if not res:
             return
+        pack_cmd, binder_cmd = res
         if self.dry_run_cb.isChecked():
             self._log_info("Dry run enabled — no external commands will be executed")
-            self._log_info(' '.join(cmd))
+            self._log_info(' '.join(pack_cmd))
+            if binder_cmd:
+                self._log_info(' '.join(binder_cmd))
             return
         # Ensure `stub.exe` exists and warn if missing (we embed whatever `stub.exe` is present)
-        stub_path = Path.cwd() / 'stub.exe'
+        stub_path = BIN_DIR / 'stub.exe'
         if not stub_path.exists():
-            self._log_warning("`stub.exe` not found in workspace — packer will embed whatever stub is present. Build `stub.exe` first for GUI (no console) behavior.")
+            self._log_error(f"`{stub_path}` not found — build it first (GUI build aborted).")
+            return
 
         entries = self._collect_plugin_entries()
-        plugins_temp_dir, _ = self.backend.stage_plugins(entries, log_fn=self._log_info, warn_fn=self._log_warning)
+
+        # Prepare an iconized stub BEFORE running the packer so the overlay stays intact.
+        self._icon_applied_prepack = False
+        icon_stub_path = None
+        if self._icon_path:
+            try:
+                icon_stub_path = self.backend.prepare_iconized_stub(self._icon_path, log_fn=self._log_info, warn_fn=self._log_warning)
+                if icon_stub_path:
+                    self._icon_applied_prepack = True
+            except Exception as exc:
+                self._log_warning(f"Icon prep failed; continuing without icon: {exc}")
+
+        plugins_temp_dir, copied = self.backend.stage_plugins(entries, log_fn=self._log_info, warn_fn=self._log_warning)
+        if entries and not copied:
+            self._log_error("Plugins were selected but none were staged (missing files?). Build aborted.")
+            return
+
         self._pending_plugins_dir = plugins_temp_dir
-        self._last_cmd = cmd
+        self._pending_binder_cmd = binder_cmd
+        self._last_cmd = pack_cmd
+        self._current_phase = 'packer'
         self._log_info("Starting packer in background...")
-        self._log_info(' '.join(f'"{c}"' for c in cmd))
+        self._log_info(' '.join(f'"{c}"' for c in pack_cmd))
         self.run_btn.setEnabled(False)
         self.sim_btn.setEnabled(False)
-        disable_default_plugins = plugins_temp_dir is None
-        if disable_default_plugins:
-            self._log_info("No plugins selected; default plugin directory disabled")
-        self.backend.start_process(cmd, plugin_dir=plugins_temp_dir, disable_plugins_default=disable_default_plugins)
+        # Keep default plugin scan enabled when no explicit plugin dir is set
+        disable_default_plugins = False
+        if plugins_temp_dir is None and not entries:
+            self._log_info("No plugins staged; relying on default plugin directory scan (plugins\\*.dll relative to bin)")
+        self.backend.start_process(pack_cmd, plugin_dir=plugins_temp_dir, disable_plugins_default=disable_default_plugins, workdir=str(BIN_DIR), icon_stub_override=icon_stub_path)
+
+    def _apply_icon_if_requested(self, target_path, label):
+        if not self._icon_path or not target_path:
+            return
+        try:
+            self.backend.apply_icon(target_path, self._icon_path, log_fn=self._log_info, warn_fn=self._log_warning)
+        except Exception as exc:
+            self._log_warning(f"Icon apply failed for {label}: {exc}")
 
     def _collect_logs(self, pid, payload_out):
         # Read plugin and debug logs from %TEMP% and append tail to GUI log
@@ -462,6 +659,7 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                     self._log_warning(f"Could not read {f}: {e}")
 
     def _on_backend_finished(self, rc):
+        started_binder = False
         try:
             if isinstance(rc, int) and rc >= 0:
                 u32 = rc & 0xFFFFFFFF if isinstance(rc, int) else rc
@@ -478,14 +676,36 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                     else:
                         self._log_error(f"Process exited with NTSTATUS {hex(u32)}")
                     self._log_error("This usually indicates a crash in the child process (heap corruption, access violation, etc.). Try running the executable directly in a debugger or a console to capture more details.")
+                    self._pending_binder_cmd = None
                 else:
                     if rc != 0:
                         self._log_error(f"Process exited: {rc}")
-                        self._log_error("Cryptor failed — aborting")
+                        if self._current_phase == 'packer':
+                            self._log_error("Cryptor failed — aborting")
+                            self._pending_binder_cmd = None
+                        elif self._current_phase == 'binder':
+                            self._log_error("Binder failed — aborting")
                     else:
                         self._log_info(f"Process exited: {rc}")
+                        if self._current_phase == 'packer':
+                            # Icon already applied pre-pack if requested; do not patch post-pack to avoid stripping overlay
+                            if self._pending_binder_cmd:
+                                cmd = self._pending_binder_cmd
+                                self._pending_binder_cmd = None
+                                self._current_phase = 'binder'
+                                self._log_info("Starting binder step…")
+                                worker = self.backend.start_process(cmd, plugin_dir=None, disable_plugins_default=True, workdir=str(BIN_DIR))
+                                if worker:
+                                    started_binder = True
+                                    return
+                            else:
+                                self._play_success_sound()
+                        elif self._current_phase == 'binder':
+                            self._apply_icon_if_requested(self._binder_output_path, "binder output")
+                            self._play_success_sound()
             else:
                 self._log_error(f"Cryptor failed — aborting (rc={rc})")
+                self._pending_binder_cmd = None
         finally:
             try:
                 self.backend.cleanup_plugins(self._pending_plugins_dir)
@@ -498,6 +718,8 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             except Exception:
                 pass
             self._last_cmd = None
+            if not started_binder:
+                self._current_phase = None
 
     def _append_log_row(self, level, message):
         ts = QtCore.QDateTime.currentDateTime().toString("HH:mm:ss")
@@ -557,6 +779,27 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
 
     def _log_error(self, s):
         self._append_log_row("ERROR", s)
+
+    def _init_sound(self):
+        try:
+            if not SOUND_PATH.exists():
+                return
+            effect = QtMultimedia.QSoundEffect()
+            effect.setSource(QtCore.QUrl.fromLocalFile(str(SOUND_PATH)))
+            effect.setLoopCount(1)
+            effect.setVolume(0.5)
+            self._sound = effect
+        except Exception:
+            self._sound = None
+
+    def _play_success_sound(self):
+        if not self._sound:
+            return
+        try:
+            self._sound.stop()
+            self._sound.play()
+        except Exception:
+            pass
 
 
 def main():

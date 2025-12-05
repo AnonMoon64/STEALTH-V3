@@ -24,12 +24,19 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 
-#ifdef ENABLE_FILE_LOGS
+static int plugin_log_enabled(void) {
+    static int enabled = -1;
+    if (enabled != -1) return enabled;
+    const char *env = getenv("STEALTH_PLUGIN_LOGS");
+    enabled = (env && env[0] == '1') ? 1 : 0;
+    return enabled;
+}
+
 static void write_plugin_log(const char *fmt, ...) {
+    if (!plugin_log_enabled()) return;
     char tmp[PATH_BUF_LEN];
     if (!GetTempPathA(PATH_BUF_LEN, tmp)) return;
     char path[PATH_BUF_LEN];
-    // write to a dedicated loader log to avoid clobbering plugin-written logs
     snprintf(path, PATH_BUF_LEN, "%sstealth_plugin_loader.log", tmp);
     HANDLE hf = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf == INVALID_HANDLE_VALUE) return;
@@ -39,9 +46,6 @@ static void write_plugin_log(const char *fmt, ...) {
     WriteFile(hf, "\n", 1, &written, NULL);
     CloseHandle(hf);
 }
-#else
-static void write_plugin_log(const char *fmt, ...) { (void)fmt; }
-#endif
 static void hex_to_bytes_local(const char *hex, unsigned char *bytes, size_t len) {
     if (!hex) return;
     for (size_t i = 0; i < len; i++) {
@@ -308,7 +312,11 @@ int plugin_fire_stage(int stage) {
         loaded_plugin_t *rp = matches[i];
         write_plugin_log("Firing plugin id='%s' stage=%d order=%u", rp->entry.id, rp->entry.stage, rp->entry.order);
         HMODULE h = load_blob_as_module(rp->blob, rp->blob_len, rp->entry.id);
-        if (h) successes++;
+        if (h) {
+            successes++;
+        } else {
+            write_plugin_log("Plugin '%s' failed to load (stage=%d order=%u)", rp->entry.id, rp->entry.stage, rp->entry.order);
+        }
     }
     free(matches);
     return successes;
