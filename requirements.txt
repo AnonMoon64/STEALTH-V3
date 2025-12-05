@@ -1,0 +1,4 @@
+# Python dependencies for the GUI (install if needed)
+PyQt5>=5.15.0
+# Optional packaging tool if you want to bundle the GUI later
+pyinstaller>=5.0
