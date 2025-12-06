@@ -627,10 +627,10 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         self._log_info(' '.join(f'"{c}"' for c in pack_cmd))
         self.run_btn.setEnabled(False)
         self.sim_btn.setEnabled(False)
-        # Keep default plugin scan enabled when no explicit plugin dir is set
-        disable_default_plugins = False
-        if plugins_temp_dir is None and not entries:
-            self._log_info("No plugins staged; relying on default plugin directory scan (plugins\\*.dll relative to bin)")
+        # Disable default plugin scan when no plugins are explicitly selected
+        disable_default_plugins = (not entries)
+        if disable_default_plugins:
+            self._log_info("No plugins selected; skipping all plugin overlay")
         self.backend.start_process(pack_cmd, plugin_dir=plugins_temp_dir, disable_plugins_default=disable_default_plugins, workdir=str(BIN_DIR), icon_stub_override=icon_stub_path)
 
     def _apply_icon_if_requested(self, target_path, label):
