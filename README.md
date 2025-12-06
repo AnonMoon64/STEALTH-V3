@@ -5,14 +5,15 @@ Stealthy Trojan Encryption and Loading Toolkit for Hiding
 STEALTH Crypter encrypts and packages Windows executables into stealthy standalone files with on-disk or in-memory execution, persistence, and file size inflation using junk URLs.
 
 ### Features
-- **Payload Encryption**: XOR encryption with a user-specified key.
+- **Payload Encryption**: AES/ChaCha encryption with a user-specified key.
 - **Execution Modes**:
-  - On-disk: Decrypts and runs as a file.
-  - In-memory without disk writes.
+   - On-disk: Decrypts and runs as a file.
+   - In-memory without disk writes.
+- **Plugin System**: Append custom DLL plugins to the stub; supports multiple execution stages (PRELAUNCH, POSTLAUNCH, etc.).
 - **Persistence**: Adds to Windows Startup folder.
 - **File Size Inflation**: Adds junk URLs (0-500 MB).
-- **Custom Icon**: Supports `.ico`, `.png`, `.jpg`, etc.
-- **GUI**: Built with PyQt6.
+- **Custom Icon**: Supports `.ico`, `.png`, `.jpg`, etc. (icon is now applied before plugin overlay for compatibility).
+- **GUI**: Built with PyQt6/PyQt5.
 
 ## Requirements
 - Windows (10/11)
@@ -25,17 +26,17 @@ STEALTH Crypter encrypts and packages Windows executables into stealthy standalo
 1. **Clone Repo**:
    ```bash
    git clone <repo-url>
-   cd STEALTH-Crypter
+   cd STEALTH-main
    ```
 2. **Install Python Dependencies**:
    ```bash
    pip install PyQt6 Pillow pywin32
    ```
 3. **Compile C Components**:
-   - `stub_generator.c`:
+   - `stub.c`:
      ```bash
-     x86_64-w64-mingw32-gcc -o stub_generator.exe stub_generator.c
-     .\stub_generator.exe
+     x86_64-w64-mingw32-gcc -o stub.exe stub.c
+     .\stub.exe
      ```
    - `stealth_cryptor.c`:
      ```bash
@@ -59,7 +60,7 @@ STEALTH Crypter encrypts and packages Windows executables into stealthy standalo
 
 ## Usage
 1. **Launch GUI**:
-   Run `dist\stealth_gui.exe`.
+   Run `dist\stealth_gui_pyqt.py` or `pyton stealth_gui_pyqt.py`.
 2. **Select Payload**:
    Choose an `.exe`.
 3. **Configure Output**:
@@ -68,36 +69,43 @@ STEALTH Crypter encrypts and packages Windows executables into stealthy standalo
    - Extension: `.exe`, `.scr`, `.com`.
 4. **Set Icon (Optional)**:
    Select an icon (`.ico`, `.png`, etc.).
-5. **Configure Encryption**:
+5. **Add Plugins (Optional)**:
+   Use the GUI to select one or more DLL plugins and set their execution stage/order. Plugins are appended to the stub and loaded at runtime.
+6. **Configure Encryption**:
    - Key: Default Random.
    - Junk URLs: 0-500 MB (default: 100).
    - Persistence: Enable for Startup.
    - In-Memory: Enable for no disk writes.
-6. **Encrypt**:
-   Click "Encrypt" to generate `output\encrypted.exe`.
-7. **Run Output**:
+7. **Encrypt**:
+   Click "Build" to generate `output\encrypted.exe`.
+8. **Run Output**:
    ```bash
    cd output
    .\encrypted.exe
    ```
 
 ## Project Structure
-- `stealth_gui.py`: GUI script.
-- `stub_generator.c`: Creates `stub.exe`.
-- `stealth_cryptor.c`: Encrypts payload.
+- `stealth_gui_pyqt.py`: GUI scripts.
+- `stealth_gui_backend.py`: GUI backend logic.
+- `stub.c`: Creates `stub.exe`.
+- `stealth_cryptor.c`: Encrypts payload and appends plugins.
 - `template.c`: In-memory execution DLL.
-- `audio\notification.wav`: GUI sound.
-- `icon\icon.ico`: GUI icon (optional).
+- `plugins/`: Source for custom plugins (DLLs).
+- `bin/plugins/`: Compiled plugin DLLs for appending.
+- `audio/notification.wav`: GUI sound.
+- `icon/icon.ico`: GUI icon (optional).
 
 ## Notes
 - **Stealth**: Minimizes disk writes; junk URLs evade detection.
+- **Plugin Overlay**: Icon is applied before plugin overlay is appended; do not patch icon after build or plugins will be stripped.
 - **Limits**: Needs MinGW-w64; in-memory targets `explorer.exe`.
 - **Safety**: For educational use only.
 
 ## Troubleshooting
 - **GUI Fails**: Check dependencies and files.
 - **Encryption Fails**: Verify payload and compiled files.
-- **Icon Issues**: Ensure `rcedit-x64.exe` is present.
+- **Icon Issues**: Ensure `rcedit-x64.exe` is present. Icon is now applied before plugin overlay.
+- **Plugins Not Loading**: Make sure plugins are selected in the GUI and appended during build. Do not patch icon after build.
 
 ## License
 Educational use only, as-is, no warranty. Use responsibly.
