@@ -1,5 +1,4 @@
 #
-// Restored original stub implementation from old_stub.c
 // NOTE (build/system):
 // Historically, the generated output opened a console window when launched from
 // the GUI. Root cause: the `stub` binary was built as a console subsystem,
