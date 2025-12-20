@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+*.o
+*.obj
+dist/
+build/
+
+# Temp files
+*.tmp
+*.temp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Compiled plugins (keep source, ignore compiled in root)
+/*.dll
+/*.exe
+
+# Keep bin/ compiled files but ignore temp folders
+bin/output/*.exe
+plugins_gui_*/
